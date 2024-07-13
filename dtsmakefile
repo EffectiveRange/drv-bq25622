@@ -1,0 +1,15 @@
+
+VERSION = $(shell grep Version: mrhat-bq25622/DEBIAN/control | cut -d' ' -f2)
+
+all: mrhat-bq25622/boot/overlays/mrhat-bq25622.dtbo
+	mkdir -p build
+	dpkg-deb --root-owner-group --build mrhat-bq25622 build/mrhat-bq25622_$(VERSION)-1_all.deb
+
+clean:
+	rm -rf mrhat-bq25622/boot/ build/
+
+mrhat-bq25622/boot/overlays/mrhat-bq25622.dtbo: mrhat-bq25622.dts
+	mkdir -p mrhat-bq25622/boot/overlays/
+	dtc -I dts -O dtb -o mrhat-bq25622/boot/overlays/mrhat-bq25622.dtbo mrhat-bq25622.dts
+
+.PHONY: clean all

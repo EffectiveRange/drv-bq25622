@@ -1,0 +1,13 @@
+TI BQ2xxxx Series Driver Release Notes
+============================
+
+This file contains are the release notes for the TI BQ2XXX series driver for every release.
+
+TI_BQ_V1.0(2021/12/10)
+========================
+This is the initial release. This initial includes the BQ25620 sample driver for the Linux Kernel V5.15.
+
+
+TI_BQ_V1.1(2021/12/17)
+========================
+Add the BQ2562x sample driver for the Linux Kernel V5.15.
