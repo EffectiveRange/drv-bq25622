@@ -1,5 +1,5 @@
 Package: mrhat-bq25622
 Version: 0.1.0
 Maintainer: Effective Range Kft.
-Architecture: all
+Architecture: armhf
 Description: Device Tree overlay for the TI BQ25622 charger located on Effective-Range MrHAT v1 family of extension hats
