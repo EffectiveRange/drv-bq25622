@@ -1,0 +1,22 @@
+#!/bin/bash
+if [[ -z "$(grep bq2562x_charger /etc/modules)"  ]];
+then 
+    echo "Adding bq2562x_charger to /etc/modules ..."
+    echo 'bq2562x_charger' >> /etc/modules
+    depmod
+fi
+
+if [[ -n "$(lsmod | grep bq2562x_charger)"  ]];
+then
+    echo "Removing already loaded bq2562x_charger module ..."
+    rmmod bq2562x_charger
+fi;
+
+modprobe bq2562x_charger
+
+echo "Adding in dtoverlay to boot config ..."
+grep -qE "^\s*dtoverlay=mrhat-bq25622" /boot/config.txt  ||  echo "dtoverlay=mrhat-bq25622" >> /boot/config.txt
+
+echo "reloading dtoverlay for bq2562x_charger ..."
+dtoverlay -R mrhat-bq25622 || true
+dtoverlay mrhat-bq25622

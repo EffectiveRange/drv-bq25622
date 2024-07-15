@@ -1,0 +1,10 @@
+#!/bin/bash
+echo "Removing mrhat-bq25622 from boot config ..."
+grep -qE "^\s*dtoverlay=mrhat-bq25622" /boot/config.txt  &&  sed -ri '/^\s*dtoverlay=mrhat-bq25622/d' /boot/config.txt
+echo "Unloading device tree overlay for mrhat-bq25622 ..."
+dtoverlay -R mrhat-bq25622 || true
+echo "Removing bq2562x_charger kernel module"
+rmmod bq2562x_charger
+echo "Removing module autoload for bq2562x_charger ..."
+sed -ri '/^\s*bq2562x_charger/d' /etc/modules
+depmod

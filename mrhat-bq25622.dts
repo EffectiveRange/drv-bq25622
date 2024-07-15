@@ -1,0 +1,63 @@
+/*
+* Copyright (C) 2024 Effective Range Kft.
+*
+* This program is free software; you can redistribute it and/or modify
+* it under the terms of the GNU General Public License version 2 as
+* published by the Free Software Foundation.
+*/
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+/ {
+	compatible = "brcm,bcm2835";
+	fragment@0{
+		target-path = "/";
+		__overlay__ {
+			status = "okay";
+			bat: battery {
+				compatible = "simple-battery";
+				constant-charge-current-max-microamp = <1040000>;
+				constant-charge-voltage-max-microvolt = <4200000>;
+				precharge-current-microamp = <100000>;
+				charge-term-current-microamp = <60000>;
+			};
+		};
+	};
+	
+	fragment@1 {
+		target = <&i2c1>;
+		__overlay__ {
+			status = "okay";
+			#address-cells = <1>;
+            #size-cells = <0>;
+			/* BQ25622 */
+            bq25622: charger@6b {
+                compatible = "ti,bq25622";
+                reg = <0x6b>;
+                interrupt-parent = <&gpio>;
+                interrupts = <17 IRQ_TYPE_EDGE_FALLING>; /* BQ_INT_N */
+				interrupt-names = "bqint";
+                ti,watchdog-timeout-ms = <40000>;
+                input-current-limit-microamp = <1630000>;
+                input-voltage-limit-microvolt = <4600000>;
+                monitored-battery = <&bat>;
+				ac-detect-gpios = <&gpio 4 GPIO_ACTIVE_LOW>;
+				charge-enable-gpios = <&gpio 12 GPIO_ACTIVE_HIGH>;
+    			status = "okay";
+            };
+		};
+	};
+	fragment@2 {
+		target = <&gpio>;
+		__overlay__ {
+			/* set up pin for RTC IRQ */
+			bq25622_pins: bq25622_pins {
+				brcm,pins = <4 12 17>;
+				brcm,function = <0x0 0x1 0x0>; /* in out in */
+				brcm,pull = <0 0 0>; /* none */
+			};
+		};
+	};
+};
