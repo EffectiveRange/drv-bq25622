@@ -21,6 +21,8 @@ build/bq2562x_charger.ko: driver/*.c driver/*.h
 	schroot -c buildroot -u root -d /tmp/drv-bq25622 -- make KVER=$(KVER)
 	cp /tmp/drv-bq25622/bq2562x_charger.ko build/bq2562x_charger.ko
 
+driver: build/bq2562x_charger.ko
+	@true
 
 clean:
 	rm -rf mrhat-bq25622/boot/ mrhat-bq25622/lib/ build/
@@ -45,4 +47,4 @@ quickdeploy: build/bq2562x_charger.ko
 	ssh $(TARGET) -- "sudo modprobe bq2562x_charger"
 	
 
-.PHONY: clean all deploy quickdeploy
+.PHONY: clean all deploy quickdeploy driver

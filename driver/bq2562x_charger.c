@@ -246,14 +246,14 @@ static enum power_supply_usb_type bq2562x_usb_type[] = {
 
 static bool bq2562x_get_charge_enable(struct bq2562x_device *bq)
 {
-	int ret;
-	int ce_pin;
-	int charger_enable;
-	int chrg_ctrl_0;
+	int ret = 0;
+	unsigned int ce_pin = 0;
+	int charger_enable = 0;
+	unsigned int chrg_ctrl_0 = 0;
 
 	if (bq->ce_gpio) {
 		ce_pin = RET_FAIL(gpiod_get_value_cansleep, bq->ce_gpio);
-		BQ2562X_DEBUG(bq->dev, "read CE pin: %d", ce_pin);
+		BQ2562X_DEBUG(bq->dev, "read CE pin: %u", ce_pin);
 	}
 
 	RET_NZ(regmap_read, bq->regmap, BQ2562X_CHRG_CTRL_1, &chrg_ctrl_0);
@@ -283,245 +283,181 @@ static int bq2562x_set_charge_enable(struct bq2562x_device *bq, int val)
 	return 0;
 }
 
-static int bq2562x_get_vbat_adc(struct bq2562x_device *bq)
+static int bq2562x_get_word_signed(struct bq2562x_device *bq,
+				   unsigned int baseaddr, const char *const key,
+				   unsigned step, int scale, int *res)
+{
+	int ret = 0;
+	s16 read_res = 0;
+	u8 rd_buff[2];
+	(void)key;
+
+	RET_FAIL(regmap_bulk_read, bq->regmap, baseaddr, rd_buff, 2);
+
+	read_res = (s16)(((rd_buff[1] << 8) | rd_buff[0]) >> step);
+
+	*res = read_res * scale;
+
+	BQ2562X_DEBUG(
+		bq->dev,
+		"read %s addr:%02x msb:0x%02x lsb:0x%02x read_result:%d result:%d",
+		key, baseaddr, rd_buff[1], rd_buff[0], read_res, *res);
+
+	return 0;
+}
+
+static int bq2562x_get_word_unsigned(struct bq2562x_device *bq,
+				     unsigned int baseaddr,
+				     const char *const key, unsigned step,
+				     int scale)
+{
+	int ret = 0;
+	u16 read_res = 0;
+	int res = 0;
+	u8 rd_buff[2];
+	(void)key;
+
+	RET_FAIL(regmap_bulk_read, bq->regmap, baseaddr, rd_buff, 2);
+
+	read_res = ((rd_buff[1] << 8) | rd_buff[0]) >> step;
+
+	res = read_res * scale;
+
+	BQ2562X_DEBUG(
+		bq->dev,
+		"read %s addr:%02x msb:0x%02x lsb:0x%02x read_result:%u result:%u",
+		key, baseaddr, rd_buff[1], rd_buff[0], read_res, res);
+
+	return res;
+}
+
+static int bq2562x_set_word_unsigned(struct bq2562x_device *bq,
+				     unsigned baseaddr, unsigned val,
+				     unsigned step, unsigned scale,
+				     unsigned minval, unsigned maxval)
 {
 	int ret;
-	int vbat_adc_lsb, vbat_adc_msb;
-	u16 vbat_adc;
+	int reg_val;
+	u8 wr_buff[2];
 
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_VBAT_LSB,
-		     &vbat_adc_lsb);
+	val = clamp(val, minval, maxval);
 
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_VBAT_MSB,
-		     &vbat_adc_msb);
+	reg_val = (val / scale) << step;
+	wr_buff[0] = reg_val & 0xff;
+	wr_buff[1] = (reg_val >> 8) & 0xff;
+	RET_NZ(regmap_bulk_write, bq->regmap, baseaddr, wr_buff, 2);
 
-	vbat_adc = ((vbat_adc_msb << 8) | vbat_adc_lsb) >>
-		   BQ2562X_ADC_VBAT_MOVE_STEP;
+	return 0;
+}
 
-	BQ2562X_DEBUG(bq->dev, "read vbat adc msb 0x%02x lsb 0x%02x result %d",
-		      vbat_adc_msb, vbat_adc_lsb, vbat_adc);
-	return vbat_adc * BQ2562X_ADC_VBAT_STEP_uV;
+static int bq2562x_get_vbat_adc(struct bq2562x_device *bq)
+{
+	return bq2562x_get_word_unsigned(bq, BQ2562X_ADC_VBAT_LSB, "vbat adc",
+					 BQ2562X_ADC_VBAT_MOVE_STEP,
+					 BQ2562X_ADC_VBAT_STEP_uV);
 }
 
 static int bq2562x_get_vbus_adc(struct bq2562x_device *bq)
 {
-	int ret;
-	int vbus_adc_lsb, vbus_adc_msb;
-	u16 vbus_adc;
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_VBUS_LSB,
-		     &vbus_adc_lsb);
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_VBUS_MSB,
-		     &vbus_adc_msb);
-
-	vbus_adc = ((vbus_adc_msb << 8) | vbus_adc_lsb) >>
-		   BQ2562X_ADC_VBUS_MOVE_STEP;
-
-	BQ2562X_DEBUG(bq->dev, "read vbus adc lsb 0x%02x  msb 0x%02x result %d",
-		      vbus_adc_lsb, vbus_adc_msb, vbus_adc);
-
-	return vbus_adc * BQ2562X_ADC_VBUS_STEP_uV;
+	return bq2562x_get_word_unsigned(bq, BQ2562X_ADC_VBUS_LSB, "vbus adc",
+					 BQ2562X_ADC_VBUS_MOVE_STEP,
+					 BQ2562X_ADC_VBUS_STEP_uV);
 }
 
 static int bq2562x_get_ibat_adc(struct bq2562x_device *bq)
 {
-	int ret;
-	unsigned int ibat_adc_lsb, ibat_adc_msb;
-	s16 ibat_adc;
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_IBAT_LSB,
-		     &ibat_adc_lsb);
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_IBAT_MSB,
-		     &ibat_adc_msb);
-
-	ibat_adc = (s16)((ibat_adc_msb << 8) | ibat_adc_lsb);
-
-	BQ2562X_DEBUG(bq->dev, "read ibat adc lsb 0x%02x  msb 0x%02x result %d",
-		      ibat_adc_lsb, ibat_adc_msb, ibat_adc);
-
-	return ibat_adc * BQ2562X_ADC_CURR_STEP_uA;
+	int res = 0;
+	bq2562x_get_word_signed(bq, BQ2562X_ADC_IBAT_LSB, "ibat adc", 0,
+				BQ2562X_ADC_CURR_STEP_uA, &res);
+	return 0;
 }
 
 static int bq2562x_get_ibus_adc(struct bq2562x_device *bq)
 {
-	int ret;
-	unsigned int ibus_adc_lsb, ibus_adc_msb;
-	s16 ibus_adc;
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_IBUS_LSB,
-		     &ibus_adc_lsb);
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_IBUS_MSB,
-		     &ibus_adc_msb);
-
-	ibus_adc = (s16)((ibus_adc_msb << 8) | ibus_adc_lsb);
-
-	BQ2562X_DEBUG(bq->dev, "read ibus adc lsb 0x%02x  msb 0x%02x result %d",
-		      ibus_adc_lsb, ibus_adc_msb, ibus_adc);
-
-	return ibus_adc * BQ2562X_ADC_CURR_STEP_uA;
+	int ret = 0;
+	RET_NZ_W_VAL(0, bq2562x_get_word_signed, bq, BQ2562X_ADC_IBUS_LSB,
+		     "ibus adc", 0, BQ2562X_ADC_CURR_STEP_uA, &ret);
+	return ret;
 }
 
 static int bq2562x_get_term_curr(struct bq2562x_device *bq)
 {
-	int ret;
-	int iterm_lsb, iterm_msb;
-	u16 iterm;
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_TERM_CTRL_LSB,
-		     &iterm_lsb);
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_TERM_CTRL_MSB,
-		     &iterm_msb);
-
-	iterm = ((iterm_msb << 8) | iterm_lsb) >> BQ2562X_ITERM_MOVE_STEP;
-
-	return iterm * BQ2562X_TERMCHRG_CURRENT_STEP_uA;
+	return bq2562x_get_word_unsigned(bq, BQ2562X_TERM_CTRL_LSB,
+					 "iterm curr", BQ2562X_ITERM_MOVE_STEP,
+					 BQ2562X_TERMCHRG_CURRENT_STEP_uA);
 }
 
 static int bq2562x_get_prechrg_curr(struct bq2562x_device *bq)
 {
-	int ret;
-	int prechrg_curr_lsb, prechrg_curr_msb;
-	u16 prechrg_curr;
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_PRECHRG_CTRL_LSB,
-		     &prechrg_curr_lsb);
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_PRECHRG_CTRL_MSB,
-		     &prechrg_curr_msb);
-
-	prechrg_curr = ((prechrg_curr_msb << 8) | prechrg_curr_lsb) >>
-		       BQ2562X_PRECHRG_MOVE_STEP;
-
-	return prechrg_curr * BQ2562X_PRECHRG_CURRENT_STEP_uA;
+	return bq2562x_get_word_unsigned(bq, BQ2562X_PRECHRG_CTRL_LSB,
+					 "precharge curr",
+					 BQ2562X_PRECHRG_MOVE_STEP,
+					 BQ2562X_PRECHRG_CURRENT_STEP_uA);
 }
 
 static int bq2562x_get_ichrg_curr(struct bq2562x_device *bq)
 {
 	int ret;
-	int ichg, ichg_lsb, ichg_msb;
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_CHRG_I_LIM_MSB,
-		     &ichg_msb);
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_CHRG_I_LIM_LSB,
-		     &ichg_lsb);
-
-	BQ2562X_DEBUG(bq->dev, "get charge current regs 0x%02x 0x%02x",
-		      ichg_msb, ichg_lsb);
-
-	ichg = ((ichg_msb << 8) | ichg_lsb) >> BQ2562X_ICHG_MOVE_STEP;
-
-	return ichg * BQ2562X_ICHRG_CURRENT_STEP_uA;
+	RET_NZ_W_VAL(0, bq2562x_get_word_signed, bq, BQ2562X_CHRG_I_LIM_LSB,
+		     "ichrg_curr", BQ2562X_ICHG_MOVE_STEP,
+		     BQ2562X_ICHRG_CURRENT_STEP_uA, &ret);
+	return ret;
 }
 
 static int bq2562x_set_term_curr(struct bq2562x_device *bq, int term_current)
 {
-	int reg_val;
-	int term_curr_msb, term_curr_lsb;
 	int ret;
-
-	term_current = clamp(term_current, BQ2562X_TERMCHRG_I_MIN_uA,
-			     BQ2562X_TERMCHRG_I_MAX_uA);
-
-	reg_val = (term_current / BQ2562X_TERMCHRG_CURRENT_STEP_uA)
-		  << BQ2562X_ITERM_MOVE_STEP;
-
-	term_curr_msb = (reg_val >> 8) & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_TERM_CTRL_MSB, term_curr_msb);
-
-	term_curr_lsb = reg_val & 0xff;
-
-	return regmap_write(bq->regmap, BQ2562X_TERM_CTRL_LSB, term_curr_lsb);
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_TERM_CTRL_LSB,
+		 term_current, BQ2562X_ITERM_MOVE_STEP,
+		 BQ2562X_TERMCHRG_CURRENT_STEP_uA, BQ2562X_TERMCHRG_I_MIN_uA,
+		 BQ2562X_TERMCHRG_I_MAX_uA);
+	return 0;
 }
 
 static int bq2562x_set_prechrg_curr(struct bq2562x_device *bq, int pre_current)
 {
-	int reg_val;
-	int prechrg_curr_msb, prechrg_curr_lsb;
 	int ret;
-
-	BQ2562X_DEBUG(bq->dev, "setting precharge current to %d", pre_current);
-
-	pre_current = clamp(pre_current, BQ2562X_PRECHRG_I_MIN_uA,
-			    BQ2562X_PRECHRG_I_MAX_uA);
-
-	reg_val = (pre_current / BQ2562X_PRECHRG_CURRENT_STEP_uA)
-		  << BQ2562X_PRECHRG_MOVE_STEP;
-
-	prechrg_curr_msb = (reg_val >> 8) & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_PRECHRG_CTRL_MSB,
-	       prechrg_curr_msb);
-
-	prechrg_curr_lsb = reg_val & 0xff;
-
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_PRECHRG_CTRL_LSB,
-	       prechrg_curr_lsb);
-
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_PRECHRG_CTRL_LSB,
+		 pre_current, BQ2562X_PRECHRG_MOVE_STEP,
+		 BQ2562X_PRECHRG_CURRENT_STEP_uA, BQ2562X_PRECHRG_I_MIN_uA,
+		 BQ2562X_PRECHRG_I_MAX_uA);
 	return 0;
 }
 
 static int bq2562x_set_ichrg_curr(struct bq2562x_device *bq, int chrg_curr)
 {
-	int chrg_curr_max = bq->init_data.ichg_max;
-	int ichg, ichg_msb, ichg_lsb;
 	int ret;
+	int chrg_curr_max = bq->init_data.ichg_max;
 
-	chrg_curr = clamp(chrg_curr, BQ2562X_ICHRG_I_MIN_uA, chrg_curr_max);
-
-	BQ2562X_DEBUG(bq->dev, "setting charge current to %d", chrg_curr);
-
-	ichg = ((chrg_curr / BQ2562X_ICHRG_CURRENT_STEP_uA)
-		<< BQ2562X_ICHG_MOVE_STEP);
-	ichg_msb = (ichg >> 8) & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_CHRG_I_LIM_MSB, ichg_msb);
-
-	ichg_lsb = ichg & 0xff;
-
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_CHRG_I_LIM_LSB, ichg_lsb);
-
-	BQ2562X_DEBUG(bq->dev, "setting charge current regs to 0x%02x 0x%02x",
-		      ichg_msb, ichg_lsb);
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_CHRG_I_LIM_LSB,
+		 chrg_curr, BQ2562X_ICHG_MOVE_STEP,
+		 BQ2562X_ICHRG_CURRENT_STEP_uA, BQ2562X_ICHRG_I_MIN_uA,
+		 chrg_curr_max);
 
 	return 0;
 }
 
 static int bq2562x_set_chrg_volt(struct bq2562x_device *bq, int chrg_volt)
 {
-	int chrg_volt_max = bq->init_data.vreg_max;
-	int chrg_volt_lsb, chrg_volt_msb, vlim;
 	int ret;
+	int chrg_volt_max = bq->init_data.vreg_max;
 
-	chrg_volt = clamp(chrg_volt, BQ2562X_VREG_V_MIN_uV, chrg_volt_max);
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_CHRG_V_LIM_LSB,
+		 chrg_volt, BQ2562X_CHRG_V_LIM_MOVE_STEP,
+		 BQ2562X_VREG_V_STEP_uV, BQ2562X_VREG_V_MIN_uV, chrg_volt_max);
 
-	vlim = (chrg_volt / BQ2562X_VREG_V_STEP_uV)
-	       << BQ2562X_CHRG_V_LIM_MOVE_STEP;
-	chrg_volt_msb = (vlim >> 8) & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_CHRG_V_LIM_MSB, chrg_volt_msb);
-
-	chrg_volt_lsb = vlim & 0xff;
-
-	return regmap_write(bq->regmap, BQ2562X_CHRG_V_LIM_LSB, chrg_volt_lsb);
+	return 0;
 }
 
 static int bq2562x_get_chrg_volt(struct bq2562x_device *bq)
 {
 	int ret;
-	int chrg_volt_lsb, chrg_volt_msb, chrg_volt;
 
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_CHRG_V_LIM_LSB,
-		     &chrg_volt_lsb);
+	RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_CHRG_V_LIM_LSB,
+		 "chrg volt", BQ2562X_CHRG_V_LIM_MOVE_STEP,
+		 BQ2562X_VREG_V_STEP_uV);
 
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_CHRG_V_LIM_MSB,
-		     &chrg_volt_msb);
-
-	chrg_volt = ((chrg_volt_msb << 8) | chrg_volt_lsb) >>
-		    BQ2562X_CHRG_V_LIM_MOVE_STEP;
-
-	return chrg_volt * BQ2562X_VREG_V_STEP_uV;
+	return 0;
 }
 
 static int bq2562x_set_input_volt_lim(struct bq2562x_device *bq, int vindpm)
