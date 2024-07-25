@@ -7,4 +7,5 @@ echo "Removing bq2562x_charger kernel module"
 rmmod bq2562x_charger
 echo "Removing module autoload for bq2562x_charger ..."
 sed -ri '/^\s*bq2562x_charger/d' /etc/modules
+rm -f /boot/overlays/mrhat-bq25622.dtbo
 depmod

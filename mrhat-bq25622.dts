@@ -11,53 +11,75 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 / {
-	compatible = "brcm,bcm2835";
-	fragment@0{
-		target-path = "/";
-		__overlay__ {
-			status = "okay";
-			bat: battery {
-				compatible = "simple-battery";
-				constant-charge-current-max-microamp = <1040000>;
-				constant-charge-voltage-max-microvolt = <4200000>;
-				precharge-current-microamp = <100000>;
-				charge-term-current-microamp = <60000>;
-			};
-		};
-	};
-	
-	fragment@1 {
-		target = <&i2c1>;
-		__overlay__ {
-			status = "okay";
-			#address-cells = <1>;
+    compatible = "brcm,bcm2835";
+    fragment@0{
+        target-path = "/";
+        __overlay__ {
+            status = "okay";
+            bat: battery {
+                compatible = "simple-battery";
+                constant-charge-current-max-microamp = <1040000>;
+                constant-charge-voltage-max-microvolt = <4200000>;
+                precharge-current-microamp = <100000>;
+                charge-term-current-microamp = <60000>;
+                charge-full-design-microamp-hours = <5000000>;
+                energy-full-design-microwatt-hours = <18500000>;
+            };
+        };
+    };
+    
+    fragment@1 {
+        target = <&i2c1>;
+        __overlay__ {
+            status = "okay";
+            #address-cells = <1>;
             #size-cells = <0>;
-			/* BQ25622 */
+            /* BQ25622 */
             bq25622: charger@6b {
                 compatible = "ti,bq25622";
                 reg = <0x6b>;
                 interrupt-parent = <&gpio>;
                 interrupts = <17 IRQ_TYPE_EDGE_FALLING>; /* BQ_INT_N */
-				interrupt-names = "bqint";
+                interrupt-names = "bqint";
                 ti,watchdog-timeout-ms = <40000>;
-                input-current-limit-microamp = <1630000>;
+                input-current-limit-microamp = <1600000>;
                 input-voltage-limit-microvolt = <4600000>;
+                ext-ilim-resistor = <1690>;
                 monitored-battery = <&bat>;
-				ac-detect-gpios = <&gpio 4 GPIO_ACTIVE_LOW>;
-				charge-enable-gpios = <&gpio 12 GPIO_ACTIVE_HIGH>;
-    			status = "okay";
+                charge-enable-gpios = <&gpio 12 GPIO_ACTIVE_HIGH>;
+                bat-low-voltage-microvolt = <3000000>;
+                status = "okay";
             };
-		};
-	};
-	fragment@2 {
-		target = <&gpio>;
-		__overlay__ {
-			/* set up pin for RTC IRQ */
-			bq25622_pins: bq25622_pins {
-				brcm,pins = <4 12 17>;
-				brcm,function = <0x0 0x1 0x0>; /* in out in */
-				brcm,pull = <0 0 0>; /* none */
-			};
-		};
-	};
+        };
+    };
+    fragment@2 {
+        target = <&gpio>;
+        __overlay__ {
+            /* set up pin for RTC IRQ */
+            bq25622_pins: bq25622_pins {
+                brcm,pins = <12 17>;
+                brcm,function = <0x0 0x1 0x0>; /* in out in */
+                brcm,pull = <0 0 0>; /* none */
+            };
+        };
+    };
+    __overrides__ {
+        irq_pin = <&bq25622>, "interrupts:0",
+                  <&bq25622_pins>, "brcm,pins:4";
+        ce_pin = <&bq25622>, "charge-enable-gpios:4",
+                 <&bq25622_pins>, "brcm,pins:0";
+        wd_timeout = <&bq25622>, "ti,watchdog-timeout-ms:0";
+        ce_n = <&bq25622>, "charge-enable-negate?";
+        ce_override = <&bq25622>, "charge-enable-override?";
+        max_input_uamp = <&bq25622>, "input-current-limit-microamp:0";
+        min_input_uvolt = <&bq25622>, "input-voltage-limit-microvolt:0";
+        ext_ilim_r = <&bq25622>, "ext-ilim-resistor:0";
+        bat_low_uvolt = <&bq25622>, "bat-low-voltage-microvolt:0";
+        max_charge_uA = <&bat>, "constant-charge-current-max-microamp:0";
+        pre_charge_uA = <&bat>, "precharge-current-microamp:0";
+        charge_term_uA = <&bat>, "charge-term-current-microamp:0";
+        max_charge_uV = <&bat>, "constant-charge-voltage-max-microvolt:0";
+        bat_capacity_uAh = <&bat>, "charge-full-design-microamp-hours:0";
+        bat_energy_uWh = <&bat>, "energy-full-design-microwatt-hours:0";
+    };
 };

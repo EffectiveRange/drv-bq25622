@@ -55,7 +55,7 @@ jobs:
           configFile: .devcontainer/armhf-container/devcontainer.json
           push: never
           runCmd: |
-            make -C "/workspaces/${{steps.extract.outputs.proj}}/" all
+            "/workspaces/${{steps.extract.outputs.proj}}/build.sh"
       - 
         name: Release
         uses: softprops/action-gh-release@v1

@@ -1,0 +1,27 @@
+feature: no charge on with no battery
+- add battery detection with Force IBAT discharge, add timer to check for measurement
+- detect when battery is removed, and if no battery, check for battery every watchdog TO
+
+
+feature: power conserve
+- add support for all adc register read in a single transaction
+
+feature: battery SoC
+- on init, load battery state if present, else use 0/undefined
+    - the first completed charging cycle complete will get the system to a well defined state
+- change to continous ADC with averaging, from new value when discharging, calculate consumed energy based on IBAT and VBAT and elapsed time
+- when charging, estimate battery percentage and wattage based on estimatating from charge phase
+    - constant current => from VBAT (0-25%) linear function
+    - constant voltage => from IBAT (25-100%) parabola function
+- add userspace daemon that persists percentage into etc
+
+
+feature: convenince
+- charge enable property to charger (writable)
+	- POWER_SUPPLY_PROP_CHARGE_ENABLED,
+	- POWER_SUPPLY_PROP_BATTERY_CHARGING_ENABLED,
+	- POWER_SUPPLY_PROP_CHARGING_ENABLED,
+
+feature: misc
+- determine better VSYSMIN value
+- report battert technology (Add dts entry to battery + code prop get)

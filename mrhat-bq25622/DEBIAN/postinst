@@ -17,6 +17,6 @@ modprobe bq2562x_charger
 echo "Adding in dtoverlay to boot config ..."
 grep -qE "^\s*dtoverlay=mrhat-bq25622" /boot/config.txt  ||  echo "dtoverlay=mrhat-bq25622" >> /boot/config.txt
 
-echo "reloading dtoverlay for bq2562x_charger ..."
+echo "trying to reload dtoverlay for bq2562x_charger ..."
 dtoverlay -R mrhat-bq25622 || true
-dtoverlay mrhat-bq25622
+dtoverlay mrhat-bq25622 || true

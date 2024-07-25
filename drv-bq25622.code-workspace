@@ -4,5 +4,13 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"clangd.arguments": [
+			"-header-insertion=never"
+		],
+		"clangd.fallbackFlags": [
+			"-isystem/var/chroot/buildroot/usr/src/linux-headers-6.1.21-v7+/include",
+			"-isystem/var/chroot/buildroot/usr/src/linux-headers-6.1.21-v7+/arch/arm/include",
+		]
+	}
 }
