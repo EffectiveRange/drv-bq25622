@@ -779,6 +779,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 	int ret = 0;
 	int val = 0;
 	u8 flags[3] = { 0, 0, 0 };
+	u8 stats[3] = { 0, 0, 0 };
 
 	RET_NZ(regmap_bulk_read, bq->regmap, BQ2562X_CHRG_FLAG_0, flags, 3);
 	chrg_flag_0 = flags[0];
@@ -790,62 +791,52 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		"read interrupt flags chrg_flag_0:0x%02x chrg_flag_1:0x%02x fault_flag_0:0x%02x",
 		chrg_flag_0, chrg_flag_1, fault_flag_0);
 
-	if (bq->initial || chrg_flag_0) {
-		RET_NZ(regmap_read, bq->regmap, BQ2562X_CHRG_STAT_0,
-		       &chrg_stat_0);
-		BQ2562X_DEBUG(bq->dev, "read BQ2562X_CHRG_STAT_0 as 0x%02x",
-			      chrg_stat_0);
+	RET_NZ(regmap_bulk_read, bq->regmap, BQ2562X_CHRG_STAT_0, stats, 3);
+	chrg_stat_0 = stats[0];
+	chrg_stat_1 = stats[1];
+	fault_status_0 = stats[2];
 
-		if (chrg_stat_0 & BQ2562X_WD_STAT) {
-			// process ADC averaging results
-			if (!bq->initial) {
-				bq2562x_update_adc_avg(bq, bat_state);
-			}
-			// Watchdog expire halves the ichg
-			// set to original setpoint, and readback verify
-			bq2562x_update_ichrg_curr(bq, &state->ichg_curr);
-			bq25622_disable_ext_ilim(bq, state->ilim_curr);
-			bq2562x_reset_watchdog(bq);
-			// start oneshot adc on WD expire
-			bq2562x_start_adc_oneshot(bq);
+	BQ2562X_DEBUG(
+		bq->dev,
+		"read status regs chrg_stat_0:0x%02x chrg_stat_1:0x%02x fault_status_0:0x%02x",
+		chrg_stat_0, chrg_stat_1, fault_status_0);
+
+	if (chrg_stat_0 & BQ2562X_WD_STAT) {
+		// process ADC averaging results
+		if (!bq->initial) {
+			bq2562x_update_adc_avg(bq, bat_state);
 		}
-		if ((chrg_flag_0 & BQ2562X_ADC_DONE) &&
-		    (chrg_stat_0 & BQ2562X_ADC_DONE)) {
-			BQ2562X_DEBUG(bq->dev, "ADC ready");
-			bq2562x_update_adc_now(bq, state, bat_state);
-			// Start averaging until the next WD expiry
-			bq2562x_start_adc_avg(bq);
-		}
+		// Watchdog expire halves the ichg
+		// set to original setpoint, and readback verify
+		bq2562x_update_ichrg_curr(bq, &state->ichg_curr);
+		bq25622_disable_ext_ilim(bq, state->ilim_curr);
+		bq2562x_reset_watchdog(bq);
+		// start oneshot adc on WD expire
+		bq2562x_start_adc_oneshot(bq);
+	}
+	if ((chrg_flag_0 & BQ2562X_ADC_DONE) &&
+	    (chrg_stat_0 & BQ2562X_ADC_DONE)) {
+		BQ2562X_DEBUG(bq->dev, "ADC ready");
+		bq2562x_update_adc_now(bq, state, bat_state);
+		// Start averaging until the next WD expiry
+		bq2562x_start_adc_avg(bq);
 	}
 
-	if (bq->initial || chrg_flag_1) {
-		RET_NZ(regmap_read, bq->regmap, BQ2562X_CHRG_STAT_1,
-		       &chrg_stat_1);
-
-		BQ2562X_DEBUG(bq->dev, "read BQ2562X_CHRG_STAT_1 pin as 0x%02x",
-			      chrg_stat_1);
-
-		bat_state->chrg_status = state->chrg_status =
-			chrg_stat_1 & BQ2562X_CHG_STAT_MSK;
-		state->ce_status = bq2562x_get_charge_enable(bq);
-		state->chrg_type = chrg_stat_1 & BQ2562X_VBUS_STAT_MSK;
-		state->online = bq2562x_get_online_status(chrg_stat_1);
-		bat_state->charging_state = state->charging_state =
-			get_power_supply_charging_state(bq, state, bat_state);
-		// start adc if charge status changed and not already started
-		if (!(chrg_stat_0 & BQ2562X_WD_STAT)) {
-			bq2562x_start_adc_oneshot(bq);
-		}
+	bat_state->chrg_status = state->chrg_status = chrg_stat_1 &
+						      BQ2562X_CHG_STAT_MSK;
+	state->ce_status = bq2562x_get_charge_enable(bq);
+	state->chrg_type = chrg_stat_1 & BQ2562X_VBUS_STAT_MSK;
+	state->online = bq2562x_get_online_status(chrg_stat_1);
+	bat_state->charging_state = state->charging_state =
+		get_power_supply_charging_state(bq, state, bat_state);
+	// start adc if charge status changed and not already started
+	if (!(chrg_stat_0 & BQ2562X_WD_STAT)) {
+		bq2562x_start_adc_oneshot(bq);
 	}
 
-	if (bq->initial || fault_flag_0) {
-		RET_NZ(regmap_read, bq->regmap, BQ2562X_FAULT_STAT_0,
-		       &fault_status_0);
-		bat_state->health = fault_status_0 & BQ2562X_TEMP_MASK;
-		bat_state->overvoltage = fault_status_0 &
-					 BQ2562X_BAT_FAULT_STAT;
-		state->fault_0 = fault_status_0;
-	}
+	bat_state->health = fault_status_0 & BQ2562X_TEMP_MASK;
+	bat_state->overvoltage = fault_status_0 & BQ2562X_BAT_FAULT_STAT;
+	state->fault_0 = fault_status_0;
 
 	if (bq->ac_detect_gpio) {
 		val = gpiod_get_value_cansleep(bq->ac_detect_gpio);
