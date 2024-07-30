@@ -64,7 +64,6 @@ struct bq2562x_init_data {
 	u32 vreg_max;
 	u32 ext_ilim;
 	u32 bat_cap;
-	u32 bat_low_v;
 };
 enum bq2562x_state_enum {
 	BQ2562X_STATE_INIT = 0,
@@ -124,6 +123,7 @@ struct bq2562x_device {
 	struct device *dev;
 	struct power_supply *charger;
 	struct power_supply *battery;
+	struct power_supply_battery_info *bat_info;
 	struct mutex lock;
 
 	struct regmap *regmap;
@@ -726,8 +726,6 @@ get_power_supply_charging_state(struct bq2562x_device *bq,
 static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 					struct bq2562x_battery_state *bat_state)
 {
-	int ret = 0;
-	struct power_supply_battery_info *bat_info = NULL;
 	int ri = 0;
 	int ri_temp_comp = 100;
 	int vocv = 0;
@@ -736,11 +734,8 @@ static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 	case POWER_SUPPLY_STATUS_FULL:
 		bat_state->curr_percent = 100;
 		break;
-	case POWER_SUPPLY_STATUS_CHARGING:
-	case POWER_SUPPLY_STATUS_DISCHARGING:
-		RET_NZ(power_supply_get_battery_info, bq->charger, &bat_info);
-
-		ri = power_supply_vbat2ri(bat_info, bat_state->vbat_adc_avg,
+	default:
+		ri = power_supply_vbat2ri(bq->bat_info, bat_state->vbat_adc_avg,
 					  bat_state->charging_state ==
 						  POWER_SUPPLY_STATUS_CHARGING);
 		BQ2562X_DEBUG(
@@ -750,12 +745,11 @@ static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 			bat_state->charging_state ==
 				POWER_SUPPLY_STATUS_CHARGING,
 			ri);
-		if (bat_info->resist_table) {
+		if (bq->bat_info->resist_table) {
 			ri_temp_comp = power_supply_temp2resist_simple(
-					       bat_info->resist_table,
-					       bat_info->resist_table_size,
-					       bat_state->ts_adc) /
-				       100;
+				bq->bat_info->resist_table,
+				bq->bat_info->resist_table_size,
+				bat_state->ts_adc);
 			BQ2562X_DEBUG(
 				bq->dev,
 				"ri temperature compensation at ts_adc: %u is ri_temp_comp:%d",
@@ -770,7 +764,7 @@ static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 
 		// this might return -EINVAL if ocv2cap tables are not initialized
 		bat_state->curr_percent = power_supply_batinfo_ocv2cap(
-			bat_info, vocv, bat_state->ts_adc);
+			bq->bat_info, vocv, bat_state->ts_adc);
 
 		BQ2562X_DEBUG(
 			bq->dev,
@@ -851,6 +845,12 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		val = gpiod_get_value_cansleep(bq->ac_detect_gpio);
 		BQ2562X_DEBUG(bq->dev, "read ac_detect pin as %d", val);
 		state->vbus_status = val;
+	}
+	// for the initial measurement use the momentary values
+	// to not report a bogus 0 percent capacity
+	if (bat_state->vbat_adc_avg == 0 && bat_state->ibat_adc_avg == 0) {
+		bat_state->vbat_adc_avg = bat_state->vbat_adc;
+		bat_state->ibat_adc_avg = bat_state->ibat_adc;
 	}
 	bq2562x_update_battery_state(bq, bat_state);
 	return 0;
@@ -1392,8 +1392,8 @@ static int bq2562x_map_wd_to_reg(struct bq2562x_device *bq)
 
 static int bq2562x_hw_init(struct bq2562x_device *bq)
 {
-	struct power_supply_battery_info *bat_info;
 	int ret = 0;
+
 	dev_info(bq->dev, "Initializing BQ25620/22 HW ...");
 
 	timer_setup(&bq->wd_timer_safety, bq2562x_wd_safety_timer, 0);
@@ -1403,21 +1403,22 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 	bq->watchdog_timer_reg = RET_FAIL(bq2562x_map_wd_to_reg, bq);
 	RET_NZ(bq2562x_reset_watchdog, bq);
 
-	RET_NZ(power_supply_get_battery_info, bq->charger, &bat_info);
+	RET_NZ(power_supply_get_battery_info, bq->charger, &bq->bat_info);
 
-	bq->init_data.ichg_max = bat_info->constant_charge_current_max_ua;
-	bq->init_data.vreg_max = bat_info->constant_charge_voltage_max_uv;
-	bq->init_data.bat_cap = bat_info->charge_full_design_uah;
+	bq->init_data.ichg_max = bq->bat_info->constant_charge_current_max_ua;
+	bq->init_data.vreg_max = bq->bat_info->constant_charge_voltage_max_uv;
+	bq->init_data.bat_cap = bq->bat_info->charge_full_design_uah;
 
 	bq->bat_state.curr_percent = 0;
 	// initialize charge current
 	bq->state.ichg_curr = bq->init_data.ichg_max;
 	RET_NZ(bq2562x_set_ichrg_curr, bq, bq->init_data.ichg_max);
-	RET_NZ(bq2562x_set_prechrg_curr, bq, bat_info->precharge_current_ua);
+	RET_NZ(bq2562x_set_prechrg_curr, bq,
+	       bq->bat_info->precharge_current_ua);
 	RET_NZ(bq2562x_set_chrg_volt, bq,
-	       bat_info->constant_charge_voltage_max_uv);
+	       bq->bat_info->constant_charge_voltage_max_uv);
 
-	RET_NZ(bq2562x_set_term_curr, bq, bat_info->charge_term_current_ua);
+	RET_NZ(bq2562x_set_term_curr, bq, bq->bat_info->charge_term_current_ua);
 
 	RET_NZ(bq2562x_set_input_volt_lim, bq, bq->init_data.vlim);
 
@@ -1503,11 +1504,6 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 
 	dev_info(bq->dev, "TS ADC coefficients a=%u b=%u scale=%u",
 		 bq->ts_coeff_a, bq->ts_coeff_b, bq->ts_coeff_scale);
-
-	ret = device_property_read_u32(bq->dev, "bat-low-voltage-microvolt",
-				       &bq->init_data.bat_low_v);
-	if (ret)
-		bq->init_data.bat_low_v = BQ25622_VBAT_UVLOZ_uV;
 
 	bq->ac_detect_gpio =
 		devm_gpiod_get_optional(bq->dev, "ac-detect", GPIOD_IN);
