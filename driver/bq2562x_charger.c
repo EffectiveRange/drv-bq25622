@@ -182,7 +182,7 @@ static struct reg_default bq25620_reg_defs[] = {
 	{BQ2562X_CHRG_CTRL, 0x06},
 	{BQ2562X_TIMER_CTRL, 0x5C},
 	{BQ2562X_CHRG_CTRL_1, 0xA1},
-	{BQ2562X_CHRG_CTRL_2, 0x4E},
+	{BQ2562X_CHRG_CTRL_2, 0x4F},
 	{BQ2562X_CHRG_CTRL_3, 0x04},
 	{BQ2562X_CHRG_CTRL_4, 0xC4},
 	{BQ2562X_NTC_CTRL_0, 0x3D},
@@ -240,9 +240,9 @@ static struct reg_default bq25622_reg_defs[] = {
 	{BQ2562X_CHRG_CTRL, 0x06},
 	{BQ2562X_TIMER_CTRL, 0x5C},
 	{BQ2562X_CHRG_CTRL_1, 0xA1},
-	{BQ2562X_CHRG_CTRL_2, 0x4E},
+	{BQ2562X_CHRG_CTRL_2, 0x4F},
 	{BQ2562X_CHRG_CTRL_3, 0x04},
-	{BQ2562X_CHRG_CTRL_4, 0xC4},
+	{BQ2562X_CHRG_CTRL_4, 0xC0},
 	{BQ2562X_NTC_CTRL_0, 0x3D},
 	{BQ2562X_NTC_CTRL_1, 0x25},
 	{BQ2562X_NTC_CTRL_2, 0x3F},
@@ -726,6 +726,7 @@ get_power_supply_charging_state(struct bq2562x_device *bq,
 }
 
 static int bq2562x_update_battery_state(struct bq2562x_device *bq,
+					struct bq2562x_state *state,
 					struct bq2562x_battery_state *bat_state)
 {
 	int ri = 0, ri_comp = 0, charging = 0;
@@ -761,17 +762,19 @@ static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 		bat_state->curr_percent = power_supply_batinfo_ocv2cap(
 			bq->bat_info, vocv, bat_state->ts_adc);
 		// don't report 100% while we are actively charging
-		if (charging) {
+		// using charger state to report correct value
+		// on initial evaluation as well
+		if (state->charging_state == POWER_SUPPLY_STATUS_CHARGING) {
 			bat_state->curr_percent =
 				min(bat_state->curr_percent, 99);
 		}
 		if (bq->emit_battery_diag) {
 			dev_info(
 				bq->dev,
-				"bat percent from ocv vbat_adc_avg:%u ibat_adc_avg:%d charging:%d ri:%d ts_adc:%u ri_temp_comp:%d ri_comp:%d percent:%d",
+				"bat percent from ocv vbat_adc_avg:%u ibat_adc_avg:%d charging:%d ri:%d ts_adc:%u ri_temp_comp:%d ri_comp:%d vocv:%d percent:%d",
 				bat_state->vbat_adc_avg,
 				bat_state->ibat_adc_avg, charging, ri,
-				bat_state->ts_adc, ri_temp_comp, ri_comp,
+				bat_state->ts_adc, ri_temp_comp, ri_comp, vocv,
 				bat_state->curr_percent);
 		}
 		break;
@@ -873,7 +876,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 	}
 	// only update battery state if we have up-to-date measurements
 	if (adc_avg_updated) {
-		bq2562x_update_battery_state(bq, bat_state);
+		bq2562x_update_battery_state(bq, state, bat_state);
 	}
 	return 0;
 }
@@ -1331,6 +1334,7 @@ static bool bq2562x_is_volatile_reg(struct device *dev, unsigned int reg)
 	case BQ2562X_CHRG_I_LIM_LSB:
 	case BQ2562X_CHRG_I_LIM_MSB:
 	case BQ2562X_ADC_CTRL:
+	case BQ2562X_PART_INFO:
 		return true;
 	default:
 		return false;
@@ -1503,6 +1507,11 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 	timer_setup(&bq->wd_timer_safety, bq2562x_wd_safety_timer, 0);
 	INIT_WORK(&bq->wd_safety_work, bq2562x_wd_safety_timer_work);
 	bq->wd_timer_safety_initialized = true;
+
+	// do a REG reset first, just be sure that we start from
+	// the well knwon state
+	RET_NZ(regmap_update_bits, bq->regmap, BQ2562X_CHRG_CTRL_2,
+	       BQ2562X_CHRG_CTRL2_REG_RST, BQ2562X_CHRG_CTRL2_REG_RST);
 
 	bq->watchdog_timer_reg = RET_FAIL(bq2562x_map_wd_to_reg, bq);
 	RET_NZ(bq2562x_reset_watchdog, bq);
