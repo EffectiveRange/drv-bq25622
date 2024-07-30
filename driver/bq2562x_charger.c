@@ -3,6 +3,7 @@
 // Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com/
 
 #include <linux/err.h>
+#include <linux/reboot.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
@@ -74,6 +75,7 @@ enum bq2562x_state_enum {
 };
 
 struct bq2562x_state {
+	unsigned long last_update;
 	enum bq2562x_state_enum state;
 	bool online;
 	u8 chrg_status;
@@ -97,6 +99,7 @@ struct bq2562x_state {
 };
 
 struct bq2562x_battery_state {
+	unsigned long last_update;
 	int present;
 	s32 ts_adc;
 	u32 vbat_adc;
@@ -117,6 +120,17 @@ struct bq2562x_battery_state {
 enum bq2562x_id {
 	BQ25620,
 	BQ25622,
+};
+
+enum bq2562x_shutdown_type {
+	BQ2562X_SHUT_NOOP = 0,
+	BQ2562X_SHUT_SHIP,
+	BQ2562X_SHUT_SHUTDOWN,
+};
+
+struct bq2562x_sysfs {
+	enum bq2562x_shutdown_type shutdown_type;
+	struct mutex lock;
 };
 
 struct bq2562x_device {
@@ -144,6 +158,8 @@ struct bq2562x_device {
 	struct bq2562x_init_data init_data;
 	struct bq2562x_state state;
 	struct bq2562x_battery_state bat_state;
+
+	struct bq2562x_sysfs sysfs_data;
 
 	int watchdog_timer;
 	int watchdog_timer_reg;
@@ -662,13 +678,12 @@ static int bq2562x_reset_watchdog(struct bq2562x_device *bq)
 	       (bq->watchdog_timer_reg << BQ2562X_WATCHDOG_LSB) |
 		       BQ2562X_WD_RST);
 
-	// setup safety timer to 2 times WD
-	// if in any case the WD interrupt is missed
+	// setup managing timer to WD/2
 	mod_timer(
 		&bq->wd_timer_safety,
 		jiffies +
 			msecs_to_jiffies(
-				bq2562x_watchdog_time[bq->watchdog_timer_reg] *
+				bq2562x_watchdog_time[bq->watchdog_timer_reg] /
 				2));
 
 	return 0;
@@ -782,9 +797,17 @@ static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 	return 0;
 }
 
+enum BQ2562X_ADC_START_TYPE {
+	BQ2562X_ADC_OFF = 0,
+	BQ2562X_ADC_START_ONESHOT,
+	BQ2562X_ADC_START_AVG,
+};
+
 static int bq2562x_update_state(struct bq2562x_device *bq,
 				struct bq2562x_state *state,
-				struct bq2562x_battery_state *bat_state)
+				struct bq2562x_battery_state *bat_state,
+				bool timed,
+				enum BQ2562X_ADC_START_TYPE *adc_start)
 {
 	int chrg_stat_0 = 0, chrg_stat_1 = 0, chrg_flag_0 = 0, chrg_flag_1 = 0;
 	int fault_flag_0 = 0, fault_status_0 = 0;
@@ -794,6 +817,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 	u8 stats[3] = { 0, 0, 0 };
 	bool adc_avg_updated = false;
 	bool adc_now_updated = false;
+	bool process_wd = false;
 
 	RET_NZ(regmap_bulk_read, bq->regmap, BQ2562X_CHRG_FLAG_0, flags, 3);
 	chrg_flag_0 = flags[0];
@@ -815,7 +839,8 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		"read status regs chrg_stat_0:0x%02x chrg_stat_1:0x%02x fault_status_0:0x%02x",
 		chrg_stat_0, chrg_stat_1, fault_status_0);
 
-	if (chrg_stat_0 & BQ2562X_WD_STAT) {
+	process_wd = (chrg_stat_0 & BQ2562X_WD_STAT) || timed;
+	if (process_wd) {
 		// process ADC averaging results
 		bq2562x_update_adc_avg(bq, bat_state);
 		adc_avg_updated = true;
@@ -825,7 +850,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		bq25622_disable_ext_ilim(bq, state->ilim_curr);
 		bq2562x_reset_watchdog(bq);
 		// start oneshot adc on WD expire
-		bq2562x_start_adc_oneshot(bq);
+		*adc_start = BQ2562X_ADC_START_ONESHOT;
 	}
 	if ((chrg_flag_0 & BQ2562X_ADC_DONE) &&
 	    (chrg_stat_0 & BQ2562X_ADC_DONE)) {
@@ -833,7 +858,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		bq2562x_update_adc_now(bq, state, bat_state);
 		adc_now_updated = true;
 		// Start averaging until the next WD expiry
-		bq2562x_start_adc_avg(bq);
+		*adc_start = BQ2562X_ADC_START_AVG;
 	}
 	state->ce_status = bq2562x_get_charge_enable(bq);
 	state->chrg_type = chrg_stat_1 & BQ2562X_VBUS_STAT_MSK;
@@ -850,8 +875,8 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 
 	// start adc if charge status changed and not already started
 	// on WD expiry
-	if (chrg_flag_1 && !(chrg_stat_0 & BQ2562X_WD_STAT)) {
-		bq2562x_start_adc_oneshot(bq);
+	if (chrg_flag_1 && !process_wd) {
+		*adc_start = BQ2562X_ADC_START_ONESHOT;
 	}
 
 	// this is safe to update here on initial update
@@ -1199,13 +1224,13 @@ bq2562x_initial_charge_enable(struct bq2562x_device *bq,
 	return 0;
 }
 
-static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
+static void bq2562x_manage(struct bq2562x_device *bq, bool timed)
 {
-	struct bq2562x_device *bq = private;
+	int ret = 0;
 	struct bq2562x_state state;
 	struct bq2562x_battery_state bat_state;
-	int ret;
-	BQ2562X_DEBUG(bq->dev, "bq2562x_irq_handler_thread irq: 0x%08x", irq);
+	bool updated = false, bat_update = false;
+	enum BQ2562X_ADC_START_TYPE adc_type = BQ2562X_ADC_OFF;
 	// starting off with the previous state
 	mutex_lock(&bq->lock);
 	state = bq->state;
@@ -1214,41 +1239,75 @@ static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
 
 	// Battery detection on initial startup
 	// to determine charge enable and battery presence
+	// no need for handling concurrency between invocation from the WD thread an IRQ thread
+	// as this MUST finish way before the first WD interrupt
 	if (state.state < BQ2562X_STATE_OPERATIONAL) {
 		bq2562x_initial_charge_enable(bq, &state, &bat_state);
+		bat_state.last_update = state.last_update = jiffies;
 		mutex_lock(&bq->lock);
 		bq->state = state;
 		bq->bat_state = bat_state;
 		mutex_unlock(&bq->lock);
-		goto irq_out;
+		return;
 	}
-
-	ret = bq2562x_update_state(bq, &state, &bat_state);
+	///////////////////////////
+	// Operational state below
+	ret = bq2562x_update_state(bq, &state, &bat_state, timed, &adc_type);
 	if (ret) {
 		dev_err(bq->dev, "error updating battery state");
-		goto irq_out;
+		return;
 	}
+	bat_state.last_update = state.last_update = jiffies;
 
 	if (bq2562x_state_changed(bq, &state)) {
-		BQ2562X_DEBUG(bq->dev,
-			      "bq2562x_irq_handler_thread state changed");
+		BQ2562X_DEBUG(bq->dev, "state changed");
 		mutex_lock(&bq->lock);
-		bq->state = state;
+		if (bq->state.last_update < state.last_update) {
+			bq->state = state;
+			updated = true;
+		} else {
+			dev_warn(
+				bq->dev,
+				"discarding state update as a newer one happened pid:%d",
+				current->pid);
+		}
 		mutex_unlock(&bq->lock);
-		power_supply_changed(bq->charger);
+		if (updated) {
+			power_supply_changed(bq->charger);
+		}
 	}
-
 	if (bq2562x_bat_state_changed(bq, &bat_state)) {
-		BQ2562X_DEBUG(
-			bq->dev,
-			"bq2562x_irq_handler_thread battery state changed");
+		BQ2562X_DEBUG(bq->dev, "battery state changed");
 		mutex_lock(&bq->lock);
-		bq->bat_state = bat_state;
+		if (bq->bat_state.last_update < bat_state.last_update) {
+			bq->bat_state = bat_state;
+			bat_update = true;
+		} else {
+			dev_warn(
+				bq->dev,
+				"discarding battery state update as a newer one happened pid:%d",
+				current->pid);
+		}
 		mutex_unlock(&bq->lock);
-		power_supply_changed(bq->battery);
+		if (bat_update) {
+			power_supply_changed(bq->battery);
+		}
 	}
+	// Don't eagerly start ADCs in the interrupt handler, but keep as a last step
+	// as it  might result in overlapping IRQs
+	if (adc_type == BQ2562X_ADC_START_ONESHOT) {
+		bq2562x_start_adc_oneshot(bq);
+	} else if (adc_type == BQ2562X_ADC_AVG) {
+		bq2562x_start_adc_avg(bq);
+	}
+}
 
-irq_out:
+static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
+{
+	struct bq2562x_device *bq = private;
+	BQ2562X_DEBUG(bq->dev, "bq2562x_irq_handler_thread irq:0x%08x pid:%d",
+		      irq, current->pid);
+	bq2562x_manage(bq, false);
 	return IRQ_HANDLED;
 }
 
@@ -1390,9 +1449,9 @@ static void bq2562x_wd_safety_timer_work(struct work_struct *work)
 {
 	struct bq2562x_device *bq =
 		container_of(work, struct bq2562x_device, wd_safety_work);
-	dev_warn(bq->dev,
-		 "missed watchdog interrupt, resetting watchdog manually");
-	bq2562x_reset_watchdog(bq);
+	BQ2562X_DEBUG(bq->dev, "WD timer/2 expired, managing device pid:%d",
+		      current->pid);
+	bq2562x_manage(bq, true);
 }
 
 static int bq2562x_map_wd_to_reg(struct bq2562x_device *bq)
@@ -1670,6 +1729,105 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 	return 0;
 }
 
+#define BQ2562X_SYSFS_STR(name)                                     \
+	static const char *const bq2562x_sysfs_str_##name = #name;  \
+	static const size_t const bq2562x_sysfs_str_##name##_size = \
+		sizeof(#name) - 1
+
+BQ2562X_SYSFS_STR(noop);
+BQ2562X_SYSFS_STR(ship);
+BQ2562X_SYSFS_STR(shutdown);
+
+static int bq2562x_power_off_handler(struct sys_off_data *data)
+{
+	struct bq2562x_device *bq = data->cb_data;
+	int ret = 0;
+	u8 mode = 0;
+	regcache_cache_bypass(bq->regmap, true);
+	switch (bq->sysfs_data.shutdown_type) {
+	case BQ2562X_SHUT_SHIP:
+		mode = BQ2562X_CHRG_CTRL3_BATFET_CTRL_SHIP;
+		break;
+	case BQ2562X_SHUT_SHUTDOWN:
+		mode = BQ2562X_CHRG_CTRL3_BATFET_CTRL_SHUT;
+		break;
+	default:
+		return NOTIFY_OK;
+	}
+	dev_info(bq->dev, "shutting down with shutdown type: %s",
+		 mode == BQ2562X_SHUT_SHIP ? bq2562x_sysfs_str_ship :
+					     bq2562x_sysfs_str_shutdown);
+
+	ret = regmap_update_bits(bq->regmap, BQ2562X_CHRG_CTRL_3,
+				 BQ2562X_CHRG_CTRL3_BATFET_CTRL_WVBUS |
+					 BQ2562X_CHRG_CTRL3_BATFET_CTRL,
+				 BQ2562X_CHRG_CTRL3_BATFET_CTRL_WVBUS | mode);
+	if (ret < 0) {
+		dev_err(bq->dev,
+			"failed to set BATFET_CTRL register with error:%d",
+			ret);
+		return NOTIFY_BAD;
+	}
+	return NOTIFY_OK;
+}
+
+static ssize_t bq2562x_sysfs_shutdown_type_show(struct device *dev,
+						struct device_attribute *attr,
+						char *buf)
+{
+	struct bq2562x_device *bq = dev_get_drvdata(dev);
+	enum bq2562x_shutdown_type shut;
+	const char *msg = "unknown";
+	mutex_lock(&bq->sysfs_data.lock);
+	shut = bq->sysfs_data.shutdown_type;
+	mutex_unlock(&bq->sysfs_data.lock);
+	switch (shut) {
+	case BQ2562X_SHUT_NOOP:
+		msg = bq2562x_sysfs_str_noop;
+		break;
+	case BQ2562X_SHUT_SHIP:
+		msg = bq2562x_sysfs_str_ship;
+		break;
+	case BQ2562X_SHUT_SHUTDOWN:
+		msg = bq2562x_sysfs_str_shutdown;
+		break;
+	}
+	return sprintf(buf, "%s\n", msg);
+}
+
+static ssize_t bq2562x_sysfs_shutdown_type_store(struct device *dev,
+						 struct device_attribute *attr,
+						 const char *buf, size_t count)
+{
+	struct bq2562x_device *bq = dev_get_drvdata(dev);
+	ssize_t ret = count;
+	enum bq2562x_shutdown_type shut;
+	if (strncmp(buf, bq2562x_sysfs_str_noop,
+		    min(bq2562x_sysfs_str_noop_size, count)) == 0) {
+		shut = BQ2562X_SHUT_NOOP;
+	} else if (strncmp(buf, bq2562x_sysfs_str_ship,
+			   min(bq2562x_sysfs_str_ship_size, count)) == 0) {
+		shut = BQ2562X_SHUT_SHIP;
+	} else if (strncmp(buf, bq2562x_sysfs_str_shutdown,
+			   min(bq2562x_sysfs_str_shutdown_size, count)) == 0) {
+		shut = BQ2562X_SHUT_SHUTDOWN;
+	} else {
+		dev_warn(bq->dev,
+			 "invalid value received for shutdown type from sysfs");
+		ret = -EINVAL;
+	}
+	if (ret == count) {
+		dev_info(bq->dev, "setting shutdown type to %d", shut);
+		mutex_lock(&bq->sysfs_data.lock);
+		bq->sysfs_data.shutdown_type = shut;
+		mutex_unlock(&bq->sysfs_data.lock);
+	}
+	return ret;
+}
+
+DEVICE_ATTR(shutdown_type, 0644, bq2562x_sysfs_shutdown_type_show,
+	    bq2562x_sysfs_shutdown_type_store);
+
 static int bq2562x_probe(struct i2c_client *client,
 			 const struct i2c_device_id *id)
 {
@@ -1708,6 +1866,7 @@ static int bq2562x_probe(struct i2c_client *client,
 	}
 
 	i2c_set_clientdata(client, bq);
+	dev_set_drvdata(dev, bq);
 
 	RET_NZ(bq2562x_parse_dt, bq, &psy_cfg, dev);
 
@@ -1715,6 +1874,10 @@ static int bq2562x_probe(struct i2c_client *client,
 
 	// need to allocate power supply before registering interrupt
 	RET_NZ(bq2562x_power_supply_init, bq, &psy_cfg, dev);
+
+	RET_FAIL(devm_register_sys_off_handler, dev,
+		 SYS_OFF_MODE_POWER_OFF_PREPARE, SYS_OFF_PRIO_FIRMWARE,
+		 bq2562x_power_off_handler, bq);
 
 	// NOTE: timer is potentialy setup in this func
 	// need to clean up if anything fails from here
@@ -1737,6 +1900,14 @@ static int bq2562x_probe(struct i2c_client *client,
 		}
 	}
 
+	ret = device_create_file(dev, &dev_attr_shutdown_type);
+	if (ret < 0) {
+		dev_err(dev,
+			"failed to register shutdowntype sysfs entry with code:%d",
+			ret);
+		goto err;
+	}
+
 	return 0;
 err:
 	if (bq->wd_timer_safety_initialized) {
@@ -1751,6 +1922,7 @@ static void bq2562x_remove(struct i2c_client *client)
 	struct bq2562x_device *bq = i2c_get_clientdata(client);
 	del_timer_sync(&bq->wd_timer_safety);
 	cancel_work_sync(&bq->wd_safety_work);
+	device_remove_file(bq->dev, &dev_attr_shutdown_type);
 }
 
 static const struct i2c_device_id bq2562x_i2c_ids[] = {
