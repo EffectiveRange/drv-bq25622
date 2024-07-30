@@ -3,6 +3,7 @@
 // Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com/
 
 #include <linux/err.h>
+#include <linux/reboot.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
@@ -121,6 +122,17 @@ enum bq2562x_id {
 	BQ25622,
 };
 
+enum bq2562x_shutdown_type {
+	BQ2562X_SHUT_NOOP = 0,
+	BQ2562X_SHUT_SHIP,
+	BQ2562X_SHUT_SHUTDOWN,
+};
+
+struct bq2562x_sysfs {
+	enum bq2562x_shutdown_type shutdown_type;
+	struct mutex lock;
+};
+
 struct bq2562x_device {
 	struct i2c_client *client;
 	struct device *dev;
@@ -146,6 +158,8 @@ struct bq2562x_device {
 	struct bq2562x_init_data init_data;
 	struct bq2562x_state state;
 	struct bq2562x_battery_state bat_state;
+
+	struct bq2562x_sysfs sysfs_data;
 
 	int watchdog_timer;
 	int watchdog_timer_reg;
@@ -1715,6 +1729,105 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 	return 0;
 }
 
+#define BQ2562X_SYSFS_STR(name)                                     \
+	static const char *const bq2562x_sysfs_str_##name = #name;  \
+	static const size_t const bq2562x_sysfs_str_##name##_size = \
+		sizeof(#name) - 1
+
+BQ2562X_SYSFS_STR(noop);
+BQ2562X_SYSFS_STR(ship);
+BQ2562X_SYSFS_STR(shutdown);
+
+static int bq2562x_power_off_handler(struct sys_off_data *data)
+{
+	struct bq2562x_device *bq = data->cb_data;
+	int ret = 0;
+	u8 mode = 0;
+	regcache_cache_bypass(bq->regmap, true);
+	switch (bq->sysfs_data.shutdown_type) {
+	case BQ2562X_SHUT_SHIP:
+		mode = BQ2562X_CHRG_CTRL3_BATFET_CTRL_SHIP;
+		break;
+	case BQ2562X_SHUT_SHUTDOWN:
+		mode = BQ2562X_CHRG_CTRL3_BATFET_CTRL_SHUT;
+		break;
+	default:
+		return NOTIFY_OK;
+	}
+	dev_info(bq->dev, "shutting down with shutdown type: %s",
+		 mode == BQ2562X_SHUT_SHIP ? bq2562x_sysfs_str_ship :
+					     bq2562x_sysfs_str_shutdown);
+
+	ret = regmap_update_bits(bq->regmap, BQ2562X_CHRG_CTRL_3,
+				 BQ2562X_CHRG_CTRL3_BATFET_CTRL_WVBUS |
+					 BQ2562X_CHRG_CTRL3_BATFET_CTRL,
+				 BQ2562X_CHRG_CTRL3_BATFET_CTRL_WVBUS | mode);
+	if (ret < 0) {
+		dev_err(bq->dev,
+			"failed to set BATFET_CTRL register with error:%d",
+			ret);
+		return NOTIFY_BAD;
+	}
+	return NOTIFY_OK;
+}
+
+static ssize_t bq2562x_sysfs_shutdown_type_show(struct device *dev,
+						struct device_attribute *attr,
+						char *buf)
+{
+	struct bq2562x_device *bq = dev_get_drvdata(dev);
+	enum bq2562x_shutdown_type shut;
+	const char *msg = "unknown";
+	mutex_lock(&bq->sysfs_data.lock);
+	shut = bq->sysfs_data.shutdown_type;
+	mutex_unlock(&bq->sysfs_data.lock);
+	switch (shut) {
+	case BQ2562X_SHUT_NOOP:
+		msg = bq2562x_sysfs_str_noop;
+		break;
+	case BQ2562X_SHUT_SHIP:
+		msg = bq2562x_sysfs_str_ship;
+		break;
+	case BQ2562X_SHUT_SHUTDOWN:
+		msg = bq2562x_sysfs_str_shutdown;
+		break;
+	}
+	return sprintf(buf, "%s\n", msg);
+}
+
+static ssize_t bq2562x_sysfs_shutdown_type_store(struct device *dev,
+						 struct device_attribute *attr,
+						 const char *buf, size_t count)
+{
+	struct bq2562x_device *bq = dev_get_drvdata(dev);
+	ssize_t ret = count;
+	enum bq2562x_shutdown_type shut;
+	if (strncmp(buf, bq2562x_sysfs_str_noop,
+		    min(bq2562x_sysfs_str_noop_size, count)) == 0) {
+		shut = BQ2562X_SHUT_NOOP;
+	} else if (strncmp(buf, bq2562x_sysfs_str_ship,
+			   min(bq2562x_sysfs_str_ship_size, count)) == 0) {
+		shut = BQ2562X_SHUT_SHIP;
+	} else if (strncmp(buf, bq2562x_sysfs_str_shutdown,
+			   min(bq2562x_sysfs_str_shutdown_size, count)) == 0) {
+		shut = BQ2562X_SHUT_SHUTDOWN;
+	} else {
+		dev_warn(bq->dev,
+			 "invalid value received for shutdown type from sysfs");
+		ret = -EINVAL;
+	}
+	if (ret == count) {
+		dev_info(bq->dev, "setting shutdown type to %d", shut);
+		mutex_lock(&bq->sysfs_data.lock);
+		bq->sysfs_data.shutdown_type = shut;
+		mutex_unlock(&bq->sysfs_data.lock);
+	}
+	return ret;
+}
+
+DEVICE_ATTR(shutdown_type, 0644, bq2562x_sysfs_shutdown_type_show,
+	    bq2562x_sysfs_shutdown_type_store);
+
 static int bq2562x_probe(struct i2c_client *client,
 			 const struct i2c_device_id *id)
 {
@@ -1753,6 +1866,7 @@ static int bq2562x_probe(struct i2c_client *client,
 	}
 
 	i2c_set_clientdata(client, bq);
+	dev_set_drvdata(dev, bq);
 
 	RET_NZ(bq2562x_parse_dt, bq, &psy_cfg, dev);
 
@@ -1760,6 +1874,10 @@ static int bq2562x_probe(struct i2c_client *client,
 
 	// need to allocate power supply before registering interrupt
 	RET_NZ(bq2562x_power_supply_init, bq, &psy_cfg, dev);
+
+	RET_FAIL(devm_register_sys_off_handler, dev,
+		 SYS_OFF_MODE_POWER_OFF_PREPARE, SYS_OFF_PRIO_FIRMWARE,
+		 bq2562x_power_off_handler, bq);
 
 	// NOTE: timer is potentialy setup in this func
 	// need to clean up if anything fails from here
@@ -1782,6 +1900,14 @@ static int bq2562x_probe(struct i2c_client *client,
 		}
 	}
 
+	ret = device_create_file(dev, &dev_attr_shutdown_type);
+	if (ret < 0) {
+		dev_err(dev,
+			"failed to register shutdowntype sysfs entry with code:%d",
+			ret);
+		goto err;
+	}
+
 	return 0;
 err:
 	if (bq->wd_timer_safety_initialized) {
@@ -1796,6 +1922,7 @@ static void bq2562x_remove(struct i2c_client *client)
 	struct bq2562x_device *bq = i2c_get_clientdata(client);
 	del_timer_sync(&bq->wd_timer_safety);
 	cancel_work_sync(&bq->wd_safety_work);
+	device_remove_file(bq->dev, &dev_attr_shutdown_type);
 }
 
 static const struct i2c_device_id bq2562x_i2c_ids[] = {
