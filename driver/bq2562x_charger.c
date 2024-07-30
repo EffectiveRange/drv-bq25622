@@ -1520,6 +1520,20 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 
 	RET_NZ(bq2562x_fixup_battery_info, bq);
 
+	switch (bq->bat_info->technology) {
+	case POWER_SUPPLY_TECHNOLOGY_LION:
+	case POWER_SUPPLY_TECHNOLOGY_LIPO:
+	case POWER_SUPPLY_TECHNOLOGY_LiFe:
+	case POWER_SUPPLY_TECHNOLOGY_LiMn:
+		dev_info(bq->dev, "battery technology is:%d",
+			 bq->bat_info->technology);
+		break;
+	default:
+		dev_err(bq->dev, "unsupported battery technology:%d",
+			bq->bat_info->technology);
+		return -EINVAL;
+	}
+
 	bq->init_data.ichg_max = bq->bat_info->constant_charge_current_max_ua;
 	bq->init_data.vreg_max = bq->bat_info->constant_charge_voltage_max_uv;
 	bq->init_data.bat_cap = bq->bat_info->charge_full_design_uah;
