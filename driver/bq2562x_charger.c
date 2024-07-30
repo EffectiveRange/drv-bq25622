@@ -74,6 +74,7 @@ enum bq2562x_state_enum {
 };
 
 struct bq2562x_state {
+	unsigned long last_update;
 	enum bq2562x_state_enum state;
 	bool online;
 	u8 chrg_status;
@@ -97,6 +98,7 @@ struct bq2562x_state {
 };
 
 struct bq2562x_battery_state {
+	unsigned long last_update;
 	int present;
 	s32 ts_adc;
 	u32 vbat_adc;
@@ -662,13 +664,12 @@ static int bq2562x_reset_watchdog(struct bq2562x_device *bq)
 	       (bq->watchdog_timer_reg << BQ2562X_WATCHDOG_LSB) |
 		       BQ2562X_WD_RST);
 
-	// setup safety timer to 2 times WD
-	// if in any case the WD interrupt is missed
+	// setup managing timer to WD/2
 	mod_timer(
 		&bq->wd_timer_safety,
 		jiffies +
 			msecs_to_jiffies(
-				bq2562x_watchdog_time[bq->watchdog_timer_reg] *
+				bq2562x_watchdog_time[bq->watchdog_timer_reg] /
 				2));
 
 	return 0;
@@ -782,9 +783,17 @@ static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 	return 0;
 }
 
+enum BQ2562X_ADC_START_TYPE {
+	BQ2562X_ADC_OFF = 0,
+	BQ2562X_ADC_START_ONESHOT,
+	BQ2562X_ADC_START_AVG,
+};
+
 static int bq2562x_update_state(struct bq2562x_device *bq,
 				struct bq2562x_state *state,
-				struct bq2562x_battery_state *bat_state)
+				struct bq2562x_battery_state *bat_state,
+				bool timed,
+				enum BQ2562X_ADC_START_TYPE *adc_start)
 {
 	int chrg_stat_0 = 0, chrg_stat_1 = 0, chrg_flag_0 = 0, chrg_flag_1 = 0;
 	int fault_flag_0 = 0, fault_status_0 = 0;
@@ -794,6 +803,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 	u8 stats[3] = { 0, 0, 0 };
 	bool adc_avg_updated = false;
 	bool adc_now_updated = false;
+	bool process_wd = false;
 
 	RET_NZ(regmap_bulk_read, bq->regmap, BQ2562X_CHRG_FLAG_0, flags, 3);
 	chrg_flag_0 = flags[0];
@@ -815,7 +825,8 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		"read status regs chrg_stat_0:0x%02x chrg_stat_1:0x%02x fault_status_0:0x%02x",
 		chrg_stat_0, chrg_stat_1, fault_status_0);
 
-	if (chrg_stat_0 & BQ2562X_WD_STAT) {
+	process_wd = (chrg_stat_0 & BQ2562X_WD_STAT) || timed;
+	if (process_wd) {
 		// process ADC averaging results
 		bq2562x_update_adc_avg(bq, bat_state);
 		adc_avg_updated = true;
@@ -825,7 +836,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		bq25622_disable_ext_ilim(bq, state->ilim_curr);
 		bq2562x_reset_watchdog(bq);
 		// start oneshot adc on WD expire
-		bq2562x_start_adc_oneshot(bq);
+		*adc_start = BQ2562X_ADC_START_ONESHOT;
 	}
 	if ((chrg_flag_0 & BQ2562X_ADC_DONE) &&
 	    (chrg_stat_0 & BQ2562X_ADC_DONE)) {
@@ -833,7 +844,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		bq2562x_update_adc_now(bq, state, bat_state);
 		adc_now_updated = true;
 		// Start averaging until the next WD expiry
-		bq2562x_start_adc_avg(bq);
+		*adc_start = BQ2562X_ADC_START_AVG;
 	}
 	state->ce_status = bq2562x_get_charge_enable(bq);
 	state->chrg_type = chrg_stat_1 & BQ2562X_VBUS_STAT_MSK;
@@ -850,8 +861,8 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 
 	// start adc if charge status changed and not already started
 	// on WD expiry
-	if (chrg_flag_1 && !(chrg_stat_0 & BQ2562X_WD_STAT)) {
-		bq2562x_start_adc_oneshot(bq);
+	if (chrg_flag_1 && !process_wd) {
+		*adc_start = BQ2562X_ADC_START_ONESHOT;
 	}
 
 	// this is safe to update here on initial update
@@ -1199,13 +1210,13 @@ bq2562x_initial_charge_enable(struct bq2562x_device *bq,
 	return 0;
 }
 
-static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
+static void bq2562x_manage(struct bq2562x_device *bq, bool timed)
 {
-	struct bq2562x_device *bq = private;
+	int ret = 0;
 	struct bq2562x_state state;
 	struct bq2562x_battery_state bat_state;
-	int ret;
-	BQ2562X_DEBUG(bq->dev, "bq2562x_irq_handler_thread irq: 0x%08x", irq);
+	bool updated = false, bat_update = false;
+	enum BQ2562X_ADC_START_TYPE adc_type = BQ2562X_ADC_OFF;
 	// starting off with the previous state
 	mutex_lock(&bq->lock);
 	state = bq->state;
@@ -1214,41 +1225,75 @@ static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
 
 	// Battery detection on initial startup
 	// to determine charge enable and battery presence
+	// no need for handling concurrency between invocation from the WD thread an IRQ thread
+	// as this MUST finish way before the first WD interrupt
 	if (state.state < BQ2562X_STATE_OPERATIONAL) {
 		bq2562x_initial_charge_enable(bq, &state, &bat_state);
+		bat_state.last_update = state.last_update = jiffies;
 		mutex_lock(&bq->lock);
 		bq->state = state;
 		bq->bat_state = bat_state;
 		mutex_unlock(&bq->lock);
-		goto irq_out;
+		return;
 	}
-
-	ret = bq2562x_update_state(bq, &state, &bat_state);
+	///////////////////////////
+	// Operational state below
+	ret = bq2562x_update_state(bq, &state, &bat_state, timed, &adc_type);
 	if (ret) {
 		dev_err(bq->dev, "error updating battery state");
-		goto irq_out;
+		return;
 	}
+	bat_state.last_update = state.last_update = jiffies;
 
 	if (bq2562x_state_changed(bq, &state)) {
-		BQ2562X_DEBUG(bq->dev,
-			      "bq2562x_irq_handler_thread state changed");
+		BQ2562X_DEBUG(bq->dev, "state changed");
 		mutex_lock(&bq->lock);
-		bq->state = state;
+		if (bq->state.last_update < state.last_update) {
+			bq->state = state;
+			updated = true;
+		} else {
+			dev_warn(
+				bq->dev,
+				"discarding state update as a newer one happened pid:%d",
+				current->pid);
+		}
 		mutex_unlock(&bq->lock);
-		power_supply_changed(bq->charger);
+		if (updated) {
+			power_supply_changed(bq->charger);
+		}
 	}
-
 	if (bq2562x_bat_state_changed(bq, &bat_state)) {
-		BQ2562X_DEBUG(
-			bq->dev,
-			"bq2562x_irq_handler_thread battery state changed");
+		BQ2562X_DEBUG(bq->dev, "battery state changed");
 		mutex_lock(&bq->lock);
-		bq->bat_state = bat_state;
+		if (bq->bat_state.last_update < bat_state.last_update) {
+			bq->bat_state = bat_state;
+			bat_update = true;
+		} else {
+			dev_warn(
+				bq->dev,
+				"discarding battery state update as a newer one happened pid:%d",
+				current->pid);
+		}
 		mutex_unlock(&bq->lock);
-		power_supply_changed(bq->battery);
+		if (bat_update) {
+			power_supply_changed(bq->battery);
+		}
 	}
+	// Don't eagerly start ADCs in the interrupt handler, but keep as a last step
+	// as it  might result in overlapping IRQs
+	if (adc_type == BQ2562X_ADC_START_ONESHOT) {
+		bq2562x_start_adc_oneshot(bq);
+	} else if (adc_type == BQ2562X_ADC_AVG) {
+		bq2562x_start_adc_avg(bq);
+	}
+}
 
-irq_out:
+static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
+{
+	struct bq2562x_device *bq = private;
+	BQ2562X_DEBUG(bq->dev, "bq2562x_irq_handler_thread irq:0x%08x pid:%d",
+		      irq, current->pid);
+	bq2562x_manage(bq, false);
 	return IRQ_HANDLED;
 }
 
@@ -1390,9 +1435,9 @@ static void bq2562x_wd_safety_timer_work(struct work_struct *work)
 {
 	struct bq2562x_device *bq =
 		container_of(work, struct bq2562x_device, wd_safety_work);
-	dev_warn(bq->dev,
-		 "missed watchdog interrupt, resetting watchdog manually");
-	bq2562x_reset_watchdog(bq);
+	BQ2562X_DEBUG(bq->dev, "WD timer/2 expired, managing device pid:%d",
+		      current->pid);
+	bq2562x_manage(bq, true);
 }
 
 static int bq2562x_map_wd_to_reg(struct bq2562x_device *bq)
