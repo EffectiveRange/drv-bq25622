@@ -63,7 +63,6 @@ struct bq2562x_init_data {
 	u32 ichg_max;
 	u32 vreg_max;
 	u32 ext_ilim;
-	u32 bat_energy;
 	u32 bat_cap;
 	u32 bat_low_v;
 };
@@ -106,8 +105,7 @@ struct bq2562x_battery_state {
 	u32 vbat_adc_avg;
 	s32 ibat_adc_avg;
 	// battery SoC section
-	u32 curr_percent;
-	u32 curr_energy;
+	int curr_percent;
 
 	int charging_state;
 	u8 health;
@@ -710,9 +708,10 @@ static int bq2562x_update_adc_avg(struct bq2562x_device *bq,
 	return 0;
 }
 
-int get_power_supply_charging_state(struct bq2562x_device *bq,
-				    struct bq2562x_state *state,
-				    struct bq2562x_battery_state *bat_state)
+static int
+get_power_supply_charging_state(struct bq2562x_device *bq,
+				struct bq2562x_state *state,
+				struct bq2562x_battery_state *bat_state)
 {
 	if (!state->chrg_type || (state->chrg_type == BQ2562X_OTG_MODE))
 		return POWER_SUPPLY_STATUS_DISCHARGING;
@@ -727,65 +726,56 @@ int get_power_supply_charging_state(struct bq2562x_device *bq,
 static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 					struct bq2562x_battery_state *bat_state)
 {
-	s32 calc_energy = 0;
-	s32 ibat = 0;
-	// minimum battery voltage reached when discharging, report 1% fixed
-	if ((bat_state->charging_state == POWER_SUPPLY_STATUS_DISCHARGING ||
-	     bat_state->charging_state == POWER_SUPPLY_STATUS_NOT_CHARGING) &&
-	    bat_state->vbat_adc_avg > 0 &&
-	    bat_state->vbat_adc_avg < bq->init_data.bat_low_v) {
-		bat_state->curr_percent = 1;
-		bat_state->curr_energy = bq->init_data.bat_energy / 100;
-		return 0;
-	}
+	int ret = 0;
+	struct power_supply_battery_info *bat_info = NULL;
+	int ri = 0;
+	int ri_temp_comp = 100;
+	int vocv = 0;
 
 	switch (bat_state->charging_state) {
 	case POWER_SUPPLY_STATUS_FULL:
 		bat_state->curr_percent = 100;
-		bat_state->curr_energy = bq->init_data.bat_energy;
 		break;
 	case POWER_SUPPLY_STATUS_CHARGING:
-		switch (bat_state->chrg_status) {
-		case BQ2562X_TRICKLE_CHRG:
-			bat_state->curr_percent =
-				max(bat_state->curr_percent, (u32)1);
-			bat_state->curr_energy = bq->init_data.bat_energy *
-						 bat_state->curr_percent / 100;
-			break;
-		case BQ2562X_TOP_OFF_CHRG:
-			bat_state->curr_percent = 99;
-			bat_state->curr_energy = bq->init_data.bat_energy *
-						 bat_state->curr_percent / 100;
-			break;
-		case BQ2562X_TAPER_CHRG:
-			// FIXME: estimate SoC when chargin, using 50% for now
-			// TODO:
-			// - in standard CC report based on vbat between 1-CC_limit
-			// - in standard CV report based on Ibat between CC_limit-99%
-			bat_state->curr_percent =
-				max(bat_state->curr_percent, (u32)50);
-			bat_state->curr_energy = bq->init_data.bat_energy *
-						 bat_state->curr_percent / 100;
-			break;
-		}
-		break;
 	case POWER_SUPPLY_STATUS_DISCHARGING:
-		ibat = max(-bat_state->ibat_adc_avg, (s32)0);
-		calc_energy = bat_state->curr_energy -
-			      (ibat / 1000) * (bat_state->vbat_adc_avg / 1000) *
-				      (bq->watchdog_timer / 1000) / 3600;
+		RET_NZ(power_supply_get_battery_info, bq->charger, &bat_info);
+
+		ri = power_supply_vbat2ri(bat_info, bat_state->vbat_adc_avg,
+					  bat_state->charging_state ==
+						  POWER_SUPPLY_STATUS_CHARGING);
+		BQ2562X_DEBUG(
+			bq->dev,
+			"power_supply_vbat2ri vbat_adc_avg:%u charging:%d ri:%d",
+			bat_state->vbat_adc_avg,
+			bat_state->charging_state ==
+				POWER_SUPPLY_STATUS_CHARGING,
+			ri);
+		if (bat_info->resist_table) {
+			ri_temp_comp = power_supply_temp2resist_simple(
+					       bat_info->resist_table,
+					       bat_info->resist_table_size,
+					       bat_state->ts_adc) /
+				       100;
+			BQ2562X_DEBUG(
+				bq->dev,
+				"ri temperature compensation at ts_adc: %u is ri_temp_comp:%d",
+				bat_state->ts_adc, ri_temp_comp);
+		}
+		ri = ri * ri_temp_comp / 100;
+
+		// NOTE: ibat is negative when discharging!
+		// mA * mOhm = uV
+		vocv = bat_state->vbat_adc_avg -
+		       bat_state->ibat_adc_avg / 1000 * ri / 1000;
+
+		// this might return -EINVAL if ocv2cap tables are not initialized
+		bat_state->curr_percent = power_supply_batinfo_ocv2cap(
+			bat_info, vocv, bat_state->ts_adc);
 
 		BQ2562X_DEBUG(
 			bq->dev,
-			"SoC calc init energy: %d curr energy:%d ibat:%d vbat:%d wdt:%d calc energy:%d",
-			bq->init_data.bat_energy, bat_state->curr_energy, ibat,
-			bat_state->vbat_adc_avg, bq->watchdog_timer,
-			calc_energy);
-
-		bat_state->curr_energy =
-			clamp(calc_energy, 0, (s32)bq->init_data.bat_energy);
-		bat_state->curr_percent =
-			bat_state->curr_energy * 100 / bq->init_data.bat_energy;
+			"bat percent from ocv:%u at ts_adc: %u with ri:%d is curr_percent:%d",
+			vocv, bat_state->ts_adc, ri, bat_state->curr_percent);
 		break;
 	}
 	return 0;
@@ -1115,9 +1105,6 @@ static int bq2562x_battery_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
 		val->intval = bq->init_data.bat_cap;
 		break;
-	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
-		val->intval = bq->init_data.bat_energy;
-		break;
 	default:
 		return -EINVAL;
 	}
@@ -1197,7 +1184,7 @@ static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
 	mutex_unlock(&bq->lock);
 
 	// Battery detection on initial startup
-	// to determine charge enable
+	// to determine charge enable and battery presence
 	if (state.state < BQ2562X_STATE_OPERATIONAL) {
 		bq2562x_initial_charge_enable(bq, &state, &bat_state);
 		mutex_lock(&bq->lock);
@@ -1269,7 +1256,6 @@ static enum power_supply_property bq2562x_battery_props[] = {
 	POWER_SUPPLY_PROP_CURRENT_AVG,
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
-	POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN,
 	POWER_SUPPLY_PROP_TEMP,
 };
 
@@ -1363,14 +1349,14 @@ static int bq2562x_power_supply_init(struct bq2562x_device *bq,
 	return 0;
 }
 
-void bq2562x_wd_safety_timer(struct timer_list *timer)
+static void bq2562x_wd_safety_timer(struct timer_list *timer)
 {
 	struct bq2562x_device *bq =
 		container_of(timer, struct bq2562x_device, wd_timer_safety);
 	schedule_work(&bq->wd_safety_work);
 }
 
-void bq2562x_wd_safety_timer_work(struct work_struct *work)
+static void bq2562x_wd_safety_timer_work(struct work_struct *work)
 {
 	struct bq2562x_device *bq =
 		container_of(work, struct bq2562x_device, wd_safety_work);
@@ -1407,9 +1393,7 @@ static int bq2562x_map_wd_to_reg(struct bq2562x_device *bq)
 static int bq2562x_hw_init(struct bq2562x_device *bq)
 {
 	struct power_supply_battery_info *bat_info;
-	struct power_supply_battery_info default_bat_info = {};
 	int ret = 0;
-	memset(&default_bat_info, 0, sizeof(default_bat_info));
 	dev_info(bq->dev, "Initializing BQ25620/22 HW ...");
 
 	timer_setup(&bq->wd_timer_safety, bq2562x_wd_safety_timer, 0);
@@ -1424,12 +1408,8 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 	bq->init_data.ichg_max = bat_info->constant_charge_current_max_ua;
 	bq->init_data.vreg_max = bat_info->constant_charge_voltage_max_uv;
 	bq->init_data.bat_cap = bat_info->charge_full_design_uah;
-	bq->init_data.bat_energy = bat_info->energy_full_design_uwh;
 
-	// TODO: determine initial percent
-	bq->bat_state.curr_percent = 50;
-	bq->bat_state.curr_energy =
-		bq->init_data.bat_energy * bq->bat_state.curr_percent / 100;
+	bq->bat_state.curr_percent = 0;
 	// initialize charge current
 	bq->state.ichg_curr = bq->init_data.ichg_max;
 	RET_NZ(bq2562x_set_ichrg_curr, bq, bq->init_data.ichg_max);
@@ -1443,8 +1423,6 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 
 	RET_NZ(bq2562x_set_input_curr_lim, bq, bq->init_data.ilim);
 	bq->state.ilim_curr = bq->init_data.ilim;
-
-	power_supply_put_battery_info(bq->charger, bat_info);
 
 	RET_NZ(bq2562x_start_adc_oneshot, bq);
 
