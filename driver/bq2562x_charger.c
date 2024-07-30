@@ -67,8 +67,15 @@ struct bq2562x_init_data {
 	u32 bat_cap;
 	u32 bat_low_v;
 };
+enum bq2562x_state_enum {
+	BQ2562X_STATE_INIT = 0,
+	BQ2562X_STATE_IBAT_DIS_ADC1,
+	BQ2562X_STATE_IBAT_DIS_ADC2,
+	BQ2562X_STATE_OPERATIONAL
+};
 
 struct bq2562x_state {
+	enum bq2562x_state_enum state;
 	bool online;
 	u8 chrg_status;
 	u8 ce_status;
@@ -91,6 +98,7 @@ struct bq2562x_state {
 };
 
 struct bq2562x_battery_state {
+	int present;
 	s32 ts_adc;
 	u32 vbat_adc;
 	s32 ibat_adc;
@@ -128,13 +136,16 @@ struct bq2562x_device {
 	struct gpio_desc *ac_detect_gpio;
 	struct gpio_desc *ce_gpio;
 
+	// in case we missed a WD interrupt
+	// we'll have a safety timer, that triggers a watchdog reset
+	struct timer_list wd_timer_safety;
+	struct work_struct wd_safety_work;
+	bool wd_timer_safety_initialized;
+
 	struct bq2562x_init_data init_data;
 	struct bq2562x_state state;
 	struct bq2562x_battery_state bat_state;
-	// to signal initial status read
-	// to not only react to flags, but
-	// read all status regs on first read
-	bool initial;
+
 	int watchdog_timer;
 	int watchdog_timer_reg;
 	// TS ADC reading -> Celsius := (ADC * - ts_coeff_a +  ts_coeff_b)/ts_coeff_scale
@@ -650,6 +661,16 @@ static int bq2562x_reset_watchdog(struct bq2562x_device *bq)
 	       BQ2562X_WATCHDOG_MASK | BQ2562X_WD_RST,
 	       (bq->watchdog_timer_reg << BQ2562X_WATCHDOG_LSB) |
 		       BQ2562X_WD_RST);
+
+	// setup safety timer to 2 times WD
+	// if in any case the WD interrupt is missed
+	mod_timer(
+		&bq->wd_timer_safety,
+		jiffies +
+			msecs_to_jiffies(
+				bq2562x_watchdog_time[bq->watchdog_timer_reg] *
+				2));
+
 	return 0;
 }
 
@@ -803,9 +824,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 
 	if (chrg_stat_0 & BQ2562X_WD_STAT) {
 		// process ADC averaging results
-		if (!bq->initial) {
-			bq2562x_update_adc_avg(bq, bat_state);
-		}
+		bq2562x_update_adc_avg(bq, bat_state);
 		// Watchdog expire halves the ichg
 		// set to original setpoint, and readback verify
 		bq2562x_update_ichrg_curr(bq, &state->ichg_curr);
@@ -830,7 +849,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 	bat_state->charging_state = state->charging_state =
 		get_power_supply_charging_state(bq, state, bat_state);
 	// start adc if charge status changed and not already started
-	if (!(chrg_stat_0 & BQ2562X_WD_STAT)) {
+	if (chrg_flag_1 && !(chrg_stat_0 & BQ2562X_WD_STAT)) {
 		bq2562x_start_adc_oneshot(bq);
 	}
 
@@ -844,13 +863,19 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		state->vbus_status = val;
 	}
 	bq2562x_update_battery_state(bq, bat_state);
-	bq->initial = false;
 	return 0;
 }
 
 static void bq2562x_charger_reset(void *data)
 {
 	// TODO: figure out if this is needed or not
+}
+
+static void bq2562x_force_ibat_dis(struct bq2562x_device *bq, u8 val)
+{
+	regmap_update_bits(bq->regmap, BQ2562X_CHRG_CTRL_1,
+			   BQ2562X_CHRG_CTRL1_FORCE_IBATDIS,
+			   BQ2562X_CHRG_CTRL1_FORCE_IBATDIS * (val ? 1 : 0));
 }
 
 static int bq2562x_set_property(struct power_supply *psy,
@@ -900,7 +925,6 @@ static int bq2562x_get_property(struct power_supply *psy,
 	struct bq2562x_device *bq = power_supply_get_drvdata(psy);
 	struct bq2562x_state state;
 	int ret = 0;
-	BQ2562X_DEBUG(bq->dev, "bq2562x_get_property prop: 0x%08x", psp);
 
 	mutex_lock(&bq->lock);
 	state = bq->state;
@@ -911,10 +935,6 @@ static int bq2562x_get_property(struct power_supply *psy,
 		val->intval = state.charging_state;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
-		BQ2562X_DEBUG(
-			bq->dev,
-			"POWER_SUPPLY_PROP_CHARGE_TYPE charge status 0x%02x",
-			state.chrg_status);
 		switch (state.chrg_status) {
 		case BQ2562X_TRICKLE_CHRG:
 			val->intval = POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
@@ -1024,14 +1044,15 @@ static int bq2562x_battery_get_property(struct power_supply *psy,
 	struct bq2562x_device *bq = power_supply_get_drvdata(psy);
 	struct bq2562x_battery_state state;
 	int ret = 0;
-	BQ2562X_DEBUG(bq->dev, "bq2562x_battery_get_property prop: 0x%08x",
-		      psp);
 
 	mutex_lock(&bq->lock);
 	state = bq->bat_state;
 	mutex_unlock(&bq->lock);
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_PRESENT:
+		val->intval = state.present;
+		break;
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = state.charging_state;
 		break;
@@ -1129,6 +1150,39 @@ static bool bq2562x_bat_state_changed(struct bq2562x_device *bq,
 		      sizeof(struct bq2562x_battery_state)) != 0;
 }
 
+static int
+bq2562x_initial_charge_enable(struct bq2562x_device *bq,
+			      struct bq2562x_state *state,
+			      struct bq2562x_battery_state *bat_state)
+{
+	u8 flags[3] = { 0, 0, 0 };
+	int bat_present = 0;
+	regmap_bulk_read(bq->regmap, BQ2562X_CHRG_FLAG_0, flags, 3);
+
+	BQ2562X_DEBUG(
+		bq->dev,
+		"read interrupt flags for init state:%d chrg_flag_0:0x%02x chrg_flag_1:0x%02x fault_flag_0:0x%02x",
+		state->state, flags[0], flags[1], flags[2]);
+
+	bq2562x_update_adc_now(bq, state, bat_state);
+
+	bq2562x_force_ibat_dis(bq, state->state != BQ2562X_STATE_IBAT_DIS_ADC2);
+
+	bat_present = state->state == BQ2562X_STATE_IBAT_DIS_ADC2 &&
+				      bat_state->vbat_adc >=
+					      BQ25622_VBAT_UVLO_uV ?
+			      1 :
+			      0;
+	bq2562x_set_charge_enable(bq, bat_present);
+
+	bat_state->present = bat_present;
+	state->state += 1;
+
+	bq2562x_reset_watchdog(bq);
+	bq2562x_start_adc_oneshot(bq);
+	return 0;
+}
+
 static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
 {
 	struct bq2562x_device *bq = private;
@@ -1141,6 +1195,17 @@ static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
 	state = bq->state;
 	bat_state = bq->bat_state;
 	mutex_unlock(&bq->lock);
+
+	// Battery detection on initial startup
+	// to determine charge enable
+	if (state.state < BQ2562X_STATE_OPERATIONAL) {
+		bq2562x_initial_charge_enable(bq, &state, &bat_state);
+		mutex_lock(&bq->lock);
+		bq->state = state;
+		bq->bat_state = bat_state;
+		mutex_unlock(&bq->lock);
+		goto irq_out;
+	}
 
 	ret = bq2562x_update_state(bq, &state, &bat_state);
 	if (ret) {
@@ -1194,6 +1259,7 @@ static enum power_supply_property bq2562x_power_supply_props[] = {
 
 static enum power_supply_property bq2562x_battery_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX,
@@ -1297,65 +1363,68 @@ static int bq2562x_power_supply_init(struct bq2562x_device *bq,
 	return 0;
 }
 
+void bq2562x_wd_safety_timer(struct timer_list *timer)
+{
+	struct bq2562x_device *bq =
+		container_of(timer, struct bq2562x_device, wd_timer_safety);
+	schedule_work(&bq->wd_safety_work);
+}
+
+void bq2562x_wd_safety_timer_work(struct work_struct *work)
+{
+	struct bq2562x_device *bq =
+		container_of(work, struct bq2562x_device, wd_safety_work);
+	dev_warn(bq->dev,
+		 "missed watchdog interrupt, resetting watchdog manually");
+	bq2562x_reset_watchdog(bq);
+}
+
+static int bq2562x_map_wd_to_reg(struct bq2562x_device *bq)
+{
+	int i = 0;
+	int wd_reg_val = BQ2562X_WATCHDOG_DIS;
+	int wd_max_val = BQ2562X_NUM_WD_VAL - 1;
+	if (bq->watchdog_timer >= bq2562x_watchdog_time[wd_max_val])
+		wd_reg_val = wd_max_val;
+	else {
+		for (i = 0; i < wd_max_val; i++) {
+			if (bq->watchdog_timer >= bq2562x_watchdog_time[i] &&
+			    bq->watchdog_timer < bq2562x_watchdog_time[i + 1]) {
+				wd_reg_val = i;
+				break;
+			}
+		}
+	}
+	if (wd_reg_val == BQ2562X_WATCHDOG_DIS) {
+		dev_err(bq->dev,
+			"failed to map watchdog timer %d to watchdog reg value",
+			bq->watchdog_timer);
+		return -EINVAL;
+	}
+	return wd_reg_val;
+}
+
 static int bq2562x_hw_init(struct bq2562x_device *bq)
 {
 	struct power_supply_battery_info *bat_info;
 	struct power_supply_battery_info default_bat_info = {};
-	int wd_reg_val = BQ2562X_WATCHDOG_DIS;
-	int wd_max_val = BQ2562X_NUM_WD_VAL - 1;
 	int ret = 0;
-	int i;
-	bq->initial = true;
-	dev_info(bq->dev, "Intializing BQ25620/22 HW ...");
+	memset(&default_bat_info, 0, sizeof(default_bat_info));
+	dev_info(bq->dev, "Initializing BQ25620/22 HW ...");
 
-	if (bq->watchdog_timer) {
-		if (bq->watchdog_timer >= bq2562x_watchdog_time[wd_max_val])
-			wd_reg_val = wd_max_val;
-		else {
-			for (i = 0; i < wd_max_val; i++) {
-				if (bq->watchdog_timer >=
-					    bq2562x_watchdog_time[i] &&
-				    bq->watchdog_timer <
-					    bq2562x_watchdog_time[i + 1]) {
-					wd_reg_val = i;
-					break;
-				}
-			}
-		}
-	}
-	bq->watchdog_timer_reg = wd_reg_val;
+	timer_setup(&bq->wd_timer_safety, bq2562x_wd_safety_timer, 0);
+	INIT_WORK(&bq->wd_safety_work, bq2562x_wd_safety_timer_work);
+	bq->wd_timer_safety_initialized = true;
 
+	bq->watchdog_timer_reg = RET_FAIL(bq2562x_map_wd_to_reg, bq);
 	RET_NZ(bq2562x_reset_watchdog, bq);
 
-	ret = power_supply_get_battery_info(bq->charger, &bat_info);
-	if (ret) {
-		dev_warn(
-			bq->dev,
-			"battery info missing, default values will be applied\n");
-		bat_info = &default_bat_info;
-		default_bat_info.constant_charge_current_max_ua =
-			BQ2562X_ICHRG_I_DEF_uA;
+	RET_NZ(power_supply_get_battery_info, bq->charger, &bat_info);
 
-		default_bat_info.constant_charge_voltage_max_uv =
-			BQ2562X_VREG_V_DEF_uV;
-
-		default_bat_info.precharge_current_ua =
-			BQ2562X_PRECHRG_I_DEF_uA;
-		default_bat_info.charge_term_current_ua =
-			BQ2562X_TERMCHRG_I_DEF_uA;
-		bq->init_data.ichg_max = BQ2562X_ICHRG_I_MAX_uA;
-		bq->init_data.vreg_max = BQ2562X_VREG_V_MAX_uV;
-		bq->init_data.bat_cap = 0;
-		bq->init_data.bat_energy = 0;
-	} else {
-		bq->init_data.ichg_max =
-			bat_info->constant_charge_current_max_ua;
-
-		bq->init_data.vreg_max =
-			bat_info->constant_charge_voltage_max_uv;
-		bq->init_data.bat_cap = bat_info->charge_full_design_uah;
-		bq->init_data.bat_energy = bat_info->energy_full_design_uwh;
-	}
+	bq->init_data.ichg_max = bat_info->constant_charge_current_max_ua;
+	bq->init_data.vreg_max = bat_info->constant_charge_voltage_max_uv;
+	bq->init_data.bat_cap = bat_info->charge_full_design_uah;
+	bq->init_data.bat_energy = bat_info->energy_full_design_uwh;
 
 	// TODO: determine initial percent
 	bq->bat_state.curr_percent = 50;
@@ -1377,12 +1446,10 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 
 	power_supply_put_battery_info(bq->charger, bat_info);
 
-	// Enable chargin by default
-	RET_NZ(bq2562x_set_charge_enable, bq, 1);
-
 	RET_NZ(bq2562x_start_adc_oneshot, bq);
 
-	bq->state.charging_state = POWER_SUPPLY_STATUS_UNKNOWN;
+	bq->bat_state.charging_state = bq->state.charging_state =
+		POWER_SUPPLY_STATUS_UNKNOWN;
 
 	return 0;
 }
@@ -1399,12 +1466,17 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 
 	ret = device_property_read_u32(bq->dev, "ti,watchdog-timeout-ms",
 				       &bq->watchdog_timer);
-	if (ret)
-		bq->watchdog_timer = BQ2562X_WATCHDOG_DIS;
+	if (ret) {
+		dev_err(bq->dev, "failed to read watchdog dt property");
+		return -EINVAL;
+	}
 
 	if (bq->watchdog_timer > BQ2562X_WATCHDOG_MAX ||
-	    bq->watchdog_timer < BQ2562X_WATCHDOG_DIS)
+	    bq->watchdog_timer < BQ2562X_WATCHDOG_DIS) {
+		dev_err(bq->dev, "invalid watchdog timer setting: %d",
+			bq->watchdog_timer);
 		return -EINVAL;
+	}
 
 	ret = device_property_read_u32(bq->dev, "input-voltage-limit-microvolt",
 				       &bq->init_data.vlim);
@@ -1536,7 +1608,13 @@ static int bq2562x_probe(struct i2c_client *client,
 	// need to allocate power supply before registering interrupt
 	RET_NZ(bq2562x_power_supply_init, bq, &psy_cfg, dev);
 
-	RET_NZ(bq2562x_hw_init, bq);
+	// NOTE: timer is potentialy setup in this func
+	// need to clean up if anything fails from here
+	ret = bq2562x_hw_init(bq);
+	if (ret) {
+		dev_err(dev, "failed to initialize HW: %d", ret);
+		goto err;
+	}
 
 	// last step to setup IRQ, as it can be called as soon as
 	// this returns, resulting in uninitialized state
@@ -1547,15 +1625,24 @@ static int bq2562x_probe(struct i2c_client *client,
 			dev_name(&client->dev), bq);
 		if (ret < 0) {
 			dev_err(dev, "get irq fail: %d\n", ret);
-			return ret;
+			goto err;
 		}
 	}
 
-	return ret;
+	return 0;
+err:
+	if (bq->wd_timer_safety_initialized) {
+		del_timer_sync(&bq->wd_timer_safety);
+		cancel_work_sync(&bq->wd_safety_work);
+	}
+	return -EPERM;
 }
 
 static void bq2562x_remove(struct i2c_client *client)
 {
+	struct bq2562x_device *bq = i2c_get_clientdata(client);
+	del_timer_sync(&bq->wd_timer_safety);
+	cancel_work_sync(&bq->wd_safety_work);
 }
 
 static const struct i2c_device_id bq2562x_i2c_ids[] = {

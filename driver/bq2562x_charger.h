@@ -69,6 +69,8 @@
 #define BQ2562X_VIRT_CTRL0		0x80
 #define BQ2562X_VIRT_CTRL1		0x81
 
+#define BQ2562X_CHRG_CTRL1_FORCE_IBATDIS    BIT(6)
+
 #define BQ2562X_CHRG_EN		    BIT(5)
 #define BQ2562X_ADC_EN		    BIT(7)
 #define BQ2562X_ADC_RATE	    BIT(6)
@@ -211,6 +213,7 @@
 #define BQ2562X_VPMID_ADC_DIS		BIT(0)
 
 #define BQ25622_VBAT_UVLOZ_uV   2500000
+#define BQ25622_VBAT_UVLO_uV    2100000
 
 /* clang-format on */
 #endif /* _BQ2562X_CHARGER_H */
