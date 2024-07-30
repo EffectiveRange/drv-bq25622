@@ -1,0 +1,2 @@
+nice to have:
+- support battery removal/reinsertion on the fly

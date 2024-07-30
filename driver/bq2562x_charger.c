@@ -2,6 +2,7 @@
 // BQ2562X driver
 // Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com/
 
+#include <linux/err.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
@@ -20,8 +21,6 @@
 #include "bq2562x_charger.h"
 
 #define BQ2562X_NUM_WD_VAL 4
-
-// #define BQ_WARN_DEBUG
 
 #ifdef BQ_WARN_DEBUG
 #define BQ2562X_DEBUG(dev, ...) dev_warn(dev, __VA_ARGS__)
@@ -64,26 +63,55 @@ struct bq2562x_init_data {
 	u32 vlim;
 	u32 ichg_max;
 	u32 vreg_max;
+	u32 ext_ilim;
+	u32 bat_cap;
+};
+enum bq2562x_state_enum {
+	BQ2562X_STATE_INIT = 0,
+	BQ2562X_STATE_IBAT_DIS_ADC1,
+	BQ2562X_STATE_IBAT_DIS_ADC2,
+	BQ2562X_STATE_OPERATIONAL
 };
 
 struct bq2562x_state {
+	enum bq2562x_state_enum state;
 	bool online;
 	u8 chrg_status;
 	u8 ce_status;
 	u8 chrg_type;
-	u8 health;
 	u8 chrg_fault;
 	u8 vsys_status;
 	u8 vbus_status;
 	u8 fault_0;
-	u32 vbat_adc;
 	u32 vbus_adc;
-	s32 ibat_adc;
 	s32 ibus_adc;
+	s32 tdie_adc;
+
 	// ICHG value is halved by Watchdog reset
 	// we'll use this is as two way variable, from the set_property
 	// site and also resetting it to this value on each WD reset event
 	u32 ichg_curr;
+	u32 ilim_curr;
+	// derived attributes
+	int charging_state;
+};
+
+struct bq2562x_battery_state {
+	int present;
+	s32 ts_adc;
+	u32 vbat_adc;
+	s32 ibat_adc;
+	// these ADC measurements are performed with averaging
+	u32 vbat_adc_avg;
+	s32 ibat_adc_avg;
+	// battery SoC section
+	int curr_percent;
+
+	int charging_state;
+	u8 health;
+	u8 chrg_status;
+	bool online;
+	bool overvoltage;
 };
 
 enum bq2562x_id {
@@ -96,6 +124,7 @@ struct bq2562x_device {
 	struct device *dev;
 	struct power_supply *charger;
 	struct power_supply *battery;
+	struct power_supply_battery_info *bat_info;
 	struct mutex lock;
 
 	struct regmap *regmap;
@@ -106,14 +135,28 @@ struct bq2562x_device {
 	struct gpio_desc *ac_detect_gpio;
 	struct gpio_desc *ce_gpio;
 
+	// in case we missed a WD interrupt
+	// we'll have a safety timer, that triggers a watchdog reset
+	struct timer_list wd_timer_safety;
+	struct work_struct wd_safety_work;
+	bool wd_timer_safety_initialized;
+
 	struct bq2562x_init_data init_data;
 	struct bq2562x_state state;
-	// to signal initial status read
-	// to not only react to flags, but
-	// read all status regs on first read
-	bool initial;
+	struct bq2562x_battery_state bat_state;
+
 	int watchdog_timer;
 	int watchdog_timer_reg;
+	// TS ADC reading -> Celsius := (ADC * - ts_coeff_a +  ts_coeff_b)/ts_coeff_scale
+	int ts_coeff_a;
+	int ts_coeff_b;
+	int ts_coeff_scale;
+
+	// don't use ce pin even if specified
+	bool ce_pin_override;
+	// ce pin is active low
+	bool ce_pin_negate;
+	bool emit_battery_diag;
 };
 
 /* clang-format off */
@@ -139,7 +182,7 @@ static struct reg_default bq25620_reg_defs[] = {
 	{BQ2562X_CHRG_CTRL, 0x06},
 	{BQ2562X_TIMER_CTRL, 0x5C},
 	{BQ2562X_CHRG_CTRL_1, 0xA1},
-	{BQ2562X_CHRG_CTRL_2, 0x4E},
+	{BQ2562X_CHRG_CTRL_2, 0x4F},
 	{BQ2562X_CHRG_CTRL_3, 0x04},
 	{BQ2562X_CHRG_CTRL_4, 0xC4},
 	{BQ2562X_NTC_CTRL_0, 0x3D},
@@ -197,9 +240,9 @@ static struct reg_default bq25622_reg_defs[] = {
 	{BQ2562X_CHRG_CTRL, 0x06},
 	{BQ2562X_TIMER_CTRL, 0x5C},
 	{BQ2562X_CHRG_CTRL_1, 0xA1},
-	{BQ2562X_CHRG_CTRL_2, 0x4E},
+	{BQ2562X_CHRG_CTRL_2, 0x4F},
 	{BQ2562X_CHRG_CTRL_3, 0x04},
-	{BQ2562X_CHRG_CTRL_4, 0xC4},
+	{BQ2562X_CHRG_CTRL_4, 0xC0},
 	{BQ2562X_NTC_CTRL_0, 0x3D},
 	{BQ2562X_NTC_CTRL_1, 0x25},
 	{BQ2562X_NTC_CTRL_2, 0x3F},
@@ -246,14 +289,17 @@ static enum power_supply_usb_type bq2562x_usb_type[] = {
 
 static bool bq2562x_get_charge_enable(struct bq2562x_device *bq)
 {
-	int ret;
-	int ce_pin;
-	int charger_enable;
-	int chrg_ctrl_0;
+	int ret = 0;
+	unsigned int ce_pin = 0;
+	bool gpio_ce = false;
+	int charger_enable = 0;
+	unsigned int chrg_ctrl_0 = 0;
 
 	if (bq->ce_gpio) {
 		ce_pin = RET_FAIL(gpiod_get_value_cansleep, bq->ce_gpio);
-		BQ2562X_DEBUG(bq->dev, "read CE pin: %d", ce_pin);
+		BQ2562X_DEBUG(bq->dev, "read CE pin: %u (negate:%d)", ce_pin,
+			      bq->ce_pin_negate);
+		gpio_ce = ((bool)ce_pin) != bq->ce_pin_negate;
 	}
 
 	RET_NZ(regmap_read, bq->regmap, BQ2562X_CHRG_CTRL_1, &chrg_ctrl_0);
@@ -263,7 +309,7 @@ static bool bq2562x_get_charge_enable(struct bq2562x_device *bq)
 	BQ2562X_DEBUG(bq->dev, "read charge enable: %d.\n", charger_enable);
 
 	if (bq->ce_gpio) {
-		return charger_enable && ce_pin;
+		return charger_enable && gpio_ce;
 	}
 	return charger_enable;
 }
@@ -271,11 +317,14 @@ static bool bq2562x_get_charge_enable(struct bq2562x_device *bq)
 static int bq2562x_set_charge_enable(struct bq2562x_device *bq, int val)
 {
 	int ret;
-	BQ2562X_DEBUG(bq->dev, "setting charge enable to %d", val);
+	int gpioval;
+	BQ2562X_DEBUG(bq->dev, "setting charge enable to %d (negate:%d)", val,
+		      bq->ce_pin_negate);
 	if (bq->ce_gpio) {
+		gpioval = ((bool)val) != bq->ce_pin_negate ? 1 : 0;
 		BQ2562X_DEBUG(bq->dev, "setting charge enable gpio pin to %d",
-			      val);
-		gpiod_set_value_cansleep(bq->ce_gpio, val);
+			      gpioval);
+		gpiod_set_value_cansleep(bq->ce_gpio, gpioval);
 	}
 
 	RET_NZ(regmap_update_bits, bq->regmap, BQ2562X_CHRG_CTRL_1,
@@ -283,320 +332,272 @@ static int bq2562x_set_charge_enable(struct bq2562x_device *bq, int val)
 	return 0;
 }
 
+static int bq2562x_get_word_signed(struct bq2562x_device *bq,
+				   unsigned int baseaddr, const char *const key,
+				   unsigned step, int scale, int *res)
+{
+	int ret = 0;
+	s16 read_res = 0;
+	u8 rd_buff[2] = { 0, 0 };
+	(void)key;
+
+	RET_FAIL(regmap_bulk_read, bq->regmap, baseaddr, rd_buff, 2);
+
+	read_res = ((s16)((rd_buff[1] << 8) | rd_buff[0])) >> step;
+
+	*res = read_res * scale;
+
+	BQ2562X_DEBUG(
+		bq->dev,
+		"read %s addr:0x%02x msb:0x%02x lsb:0x%02x read_result:%d result:%d",
+		key, baseaddr, rd_buff[1], rd_buff[0], read_res, *res);
+
+	return 0;
+}
+
+static int bq2562x_get_word_unsigned(struct bq2562x_device *bq,
+				     unsigned int baseaddr,
+				     const char *const key, unsigned step,
+				     int scale)
+{
+	int ret = 0;
+	u16 read_res = 0;
+	int res = 0;
+	u8 rd_buff[2] = { 0, 0 };
+	(void)key;
+
+	RET_FAIL(regmap_bulk_read, bq->regmap, baseaddr, rd_buff, 2);
+
+	read_res = ((rd_buff[1] << 8) | rd_buff[0]) >> step;
+
+	res = read_res * scale;
+
+	BQ2562X_DEBUG(
+		bq->dev,
+		"read %s addr:0x%02x msb:0x%02x lsb:0x%02x read_result:%u result:%u",
+		key, baseaddr, rd_buff[1], rd_buff[0], read_res, res);
+
+	return res;
+}
+
+static int bq2562x_set_word_unsigned(struct bq2562x_device *bq,
+				     unsigned baseaddr, const char *const key,
+				     unsigned val, unsigned step,
+				     unsigned scale, unsigned minval,
+				     unsigned maxval)
+{
+	int ret = 0;
+	int reg_val = 0;
+	u8 wr_buff[2] = { 0, 0 };
+
+	val = clamp(val, minval, maxval);
+
+	reg_val = (val / scale) << step;
+	wr_buff[0] = reg_val & 0xff;
+	wr_buff[1] = (reg_val >> 8) & 0xff;
+	RET_NZ(regmap_bulk_write, bq->regmap, baseaddr, wr_buff, 2);
+
+	BQ2562X_DEBUG(bq->dev,
+		      "write %s addr:0x%02x val:%u msb:0x%02x lsb:0x%02x ", key,
+		      baseaddr, val, wr_buff[1], wr_buff[0]);
+
+	return 0;
+}
+
 static int bq2562x_get_vbat_adc(struct bq2562x_device *bq)
 {
-	int ret;
-	int vbat_adc_lsb, vbat_adc_msb;
-	u16 vbat_adc;
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_VBAT_LSB,
-		     &vbat_adc_lsb);
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_VBAT_MSB,
-		     &vbat_adc_msb);
-
-	vbat_adc = ((vbat_adc_msb << 8) | vbat_adc_lsb) >>
-		   BQ2562X_ADC_VBAT_MOVE_STEP;
-
-	BQ2562X_DEBUG(bq->dev, "read vbat adc msb 0x%02x lsb 0x%02x result %d",
-		      vbat_adc_msb, vbat_adc_lsb, vbat_adc);
-	return vbat_adc * BQ2562X_ADC_VBAT_STEP_uV;
+	int ret = 0;
+	return RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_ADC_VBAT_LSB,
+			"vbat adc", BQ2562X_ADC_VBAT_MOVE_STEP,
+			BQ2562X_ADC_VBAT_STEP_uV);
 }
 
 static int bq2562x_get_vbus_adc(struct bq2562x_device *bq)
 {
-	int ret;
-	int vbus_adc_lsb, vbus_adc_msb;
-	u16 vbus_adc;
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_VBUS_LSB,
-		     &vbus_adc_lsb);
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_VBUS_MSB,
-		     &vbus_adc_msb);
-
-	vbus_adc = ((vbus_adc_msb << 8) | vbus_adc_lsb) >>
-		   BQ2562X_ADC_VBUS_MOVE_STEP;
-
-	BQ2562X_DEBUG(bq->dev, "read vbus adc lsb 0x%02x  msb 0x%02x result %d",
-		      vbus_adc_lsb, vbus_adc_msb, vbus_adc);
-
-	return vbus_adc * BQ2562X_ADC_VBUS_STEP_uV;
+	int ret = 0;
+	return RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_ADC_VBUS_LSB,
+			"vbus adc", BQ2562X_ADC_VBUS_MOVE_STEP,
+			BQ2562X_ADC_VBUS_STEP_uV);
 }
 
 static int bq2562x_get_ibat_adc(struct bq2562x_device *bq)
 {
-	int ret;
-	unsigned int ibat_adc_lsb, ibat_adc_msb;
-	s16 ibat_adc;
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_IBAT_LSB,
-		     &ibat_adc_lsb);
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_IBAT_MSB,
-		     &ibat_adc_msb);
-
-	ibat_adc = (s16)((ibat_adc_msb << 8) | ibat_adc_lsb);
-
-	BQ2562X_DEBUG(bq->dev, "read ibat adc lsb 0x%02x  msb 0x%02x result %d",
-		      ibat_adc_lsb, ibat_adc_msb, ibat_adc);
-
-	return ibat_adc * BQ2562X_ADC_CURR_STEP_uA;
+	int ret = 0;
+	int res = 0;
+	RET_NZ_W_VAL(0, bq2562x_get_word_signed, bq, BQ2562X_ADC_IBAT_LSB,
+		     "ibat adc", 0, BQ2562X_ADC_CURR_STEP_uA, &res);
+	return res;
 }
 
 static int bq2562x_get_ibus_adc(struct bq2562x_device *bq)
 {
-	int ret;
-	unsigned int ibus_adc_lsb, ibus_adc_msb;
-	s16 ibus_adc;
+	int ret = 0;
+	int res = 0;
+	RET_NZ_W_VAL(0, bq2562x_get_word_signed, bq, BQ2562X_ADC_IBUS_LSB,
+		     "ibus adc", 0, BQ2562X_ADC_CURR_STEP_uA, &res);
+	return res;
+}
 
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_IBUS_LSB,
-		     &ibus_adc_lsb);
+static int bq2562x_get_tdie_adc(struct bq2562x_device *bq)
+{
+	int ret = 0;
+	int res = 0;
+	u8 sign = 0;
+	s16 read_res = 0;
+	u8 rd_buff[2] = { 0, 0 };
 
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_ADC_IBUS_MSB,
-		     &ibus_adc_msb);
+	RET_NZ_W_VAL(0, regmap_bulk_read, bq->regmap, BQ2562X_ADC_TDIE_LSB,
+		     rd_buff, 2);
 
-	ibus_adc = (s16)((ibus_adc_msb << 8) | ibus_adc_lsb);
+	sign = rd_buff[1] & BQ2562X_ADC_TDIE_MSB_MSBIT;
+	if (sign) {
+		rd_buff[1] |= ~BQ2562X_ADC_TDIE_MSB_MASK;
+	}
+	read_res = ((s16)((rd_buff[1]) | rd_buff[0]));
 
-	BQ2562X_DEBUG(bq->dev, "read ibus adc lsb 0x%02x  msb 0x%02x result %d",
-		      ibus_adc_lsb, ibus_adc_msb, ibus_adc);
+	res = read_res * BQ2562X_ADC_TDIE_TEMP_STEP_01C;
 
-	return ibus_adc * BQ2562X_ADC_CURR_STEP_uA;
+	BQ2562X_DEBUG(
+		bq->dev,
+		"read tdie adc addr:0x%02x msb:0x%02x lsb:0x%02x read_result:%d result:%d",
+		BQ2562X_ADC_TDIE_LSB, rd_buff[1], rd_buff[0], read_res, res);
+
+	return res;
+}
+
+static int bq2562x_get_ts_adc(struct bq2562x_device *bq)
+{
+	int ret = 0;
+	u16 tsadc = 0;
+	int res = 0;
+	tsadc = RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_ADC_TS_LSB,
+			 "ts adc", 0, 1);
+	res = ((int)tsadc * (-bq->ts_coeff_a) + bq->ts_coeff_b) /
+	      bq->ts_coeff_scale;
+	BQ2562X_DEBUG(bq->dev, "ts adc result is %d [0.1 Celsius]", res);
+	return res;
 }
 
 static int bq2562x_get_term_curr(struct bq2562x_device *bq)
 {
 	int ret;
-	int iterm_lsb, iterm_msb;
-	u16 iterm;
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_TERM_CTRL_LSB,
-		     &iterm_lsb);
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_TERM_CTRL_MSB,
-		     &iterm_msb);
-
-	iterm = ((iterm_msb << 8) | iterm_lsb) >> BQ2562X_ITERM_MOVE_STEP;
-
-	return iterm * BQ2562X_TERMCHRG_CURRENT_STEP_uA;
+	return RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_TERM_CTRL_LSB,
+			"iterm curr", BQ2562X_ITERM_MOVE_STEP,
+			BQ2562X_TERMCHRG_CURRENT_STEP_uA);
 }
 
 static int bq2562x_get_prechrg_curr(struct bq2562x_device *bq)
 {
 	int ret;
-	int prechrg_curr_lsb, prechrg_curr_msb;
-	u16 prechrg_curr;
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_PRECHRG_CTRL_LSB,
-		     &prechrg_curr_lsb);
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_PRECHRG_CTRL_MSB,
-		     &prechrg_curr_msb);
-
-	prechrg_curr = ((prechrg_curr_msb << 8) | prechrg_curr_lsb) >>
-		       BQ2562X_PRECHRG_MOVE_STEP;
-
-	return prechrg_curr * BQ2562X_PRECHRG_CURRENT_STEP_uA;
+	return RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_PRECHRG_CTRL_LSB,
+			"precharge curr", BQ2562X_PRECHRG_MOVE_STEP,
+			BQ2562X_PRECHRG_CURRENT_STEP_uA);
 }
 
 static int bq2562x_get_ichrg_curr(struct bq2562x_device *bq)
 {
 	int ret;
-	int ichg, ichg_lsb, ichg_msb;
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_CHRG_I_LIM_MSB,
-		     &ichg_msb);
-
-	RET_NZ_W_VAL(0, regmap_read, bq->regmap, BQ2562X_CHRG_I_LIM_LSB,
-		     &ichg_lsb);
-
-	BQ2562X_DEBUG(bq->dev, "get charge current regs 0x%02x 0x%02x",
-		      ichg_msb, ichg_lsb);
-
-	ichg = ((ichg_msb << 8) | ichg_lsb) >> BQ2562X_ICHG_MOVE_STEP;
-
-	return ichg * BQ2562X_ICHRG_CURRENT_STEP_uA;
+	return RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_CHRG_I_LIM_LSB,
+			"ichrg_curr", BQ2562X_ICHG_MOVE_STEP,
+			BQ2562X_ICHRG_CURRENT_STEP_uA);
 }
 
 static int bq2562x_set_term_curr(struct bq2562x_device *bq, int term_current)
 {
-	int reg_val;
-	int term_curr_msb, term_curr_lsb;
 	int ret;
-
-	term_current = clamp(term_current, BQ2562X_TERMCHRG_I_MIN_uA,
-			     BQ2562X_TERMCHRG_I_MAX_uA);
-
-	reg_val = (term_current / BQ2562X_TERMCHRG_CURRENT_STEP_uA)
-		  << BQ2562X_ITERM_MOVE_STEP;
-
-	term_curr_msb = (reg_val >> 8) & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_TERM_CTRL_MSB, term_curr_msb);
-
-	term_curr_lsb = reg_val & 0xff;
-
-	return regmap_write(bq->regmap, BQ2562X_TERM_CTRL_LSB, term_curr_lsb);
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_TERM_CTRL_LSB,
+		 "term curr", term_current, BQ2562X_ITERM_MOVE_STEP,
+		 BQ2562X_TERMCHRG_CURRENT_STEP_uA, BQ2562X_TERMCHRG_I_MIN_uA,
+		 BQ2562X_TERMCHRG_I_MAX_uA);
+	return 0;
 }
 
 static int bq2562x_set_prechrg_curr(struct bq2562x_device *bq, int pre_current)
 {
-	int reg_val;
-	int prechrg_curr_msb, prechrg_curr_lsb;
 	int ret;
-
-	BQ2562X_DEBUG(bq->dev, "setting precharge current to %d", pre_current);
-
-	pre_current = clamp(pre_current, BQ2562X_PRECHRG_I_MIN_uA,
-			    BQ2562X_PRECHRG_I_MAX_uA);
-
-	reg_val = (pre_current / BQ2562X_PRECHRG_CURRENT_STEP_uA)
-		  << BQ2562X_PRECHRG_MOVE_STEP;
-
-	prechrg_curr_msb = (reg_val >> 8) & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_PRECHRG_CTRL_MSB,
-	       prechrg_curr_msb);
-
-	prechrg_curr_lsb = reg_val & 0xff;
-
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_PRECHRG_CTRL_LSB,
-	       prechrg_curr_lsb);
-
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_PRECHRG_CTRL_LSB,
+		 "prechrg curr", pre_current, BQ2562X_PRECHRG_MOVE_STEP,
+		 BQ2562X_PRECHRG_CURRENT_STEP_uA, BQ2562X_PRECHRG_I_MIN_uA,
+		 BQ2562X_PRECHRG_I_MAX_uA);
 	return 0;
 }
 
 static int bq2562x_set_ichrg_curr(struct bq2562x_device *bq, int chrg_curr)
 {
-	int chrg_curr_max = bq->init_data.ichg_max;
-	int ichg, ichg_msb, ichg_lsb;
 	int ret;
-
-	chrg_curr = clamp(chrg_curr, BQ2562X_ICHRG_I_MIN_uA, chrg_curr_max);
-
-	BQ2562X_DEBUG(bq->dev, "setting charge current to %d", chrg_curr);
-
-	ichg = ((chrg_curr / BQ2562X_ICHRG_CURRENT_STEP_uA)
-		<< BQ2562X_ICHG_MOVE_STEP);
-	ichg_msb = (ichg >> 8) & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_CHRG_I_LIM_MSB, ichg_msb);
-
-	ichg_lsb = ichg & 0xff;
-
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_CHRG_I_LIM_LSB, ichg_lsb);
-
-	BQ2562X_DEBUG(bq->dev, "setting charge current regs to 0x%02x 0x%02x",
-		      ichg_msb, ichg_lsb);
-
+	int chrg_curr_max = bq->init_data.ichg_max;
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_CHRG_I_LIM_LSB,
+		 "ichrg curr", chrg_curr, BQ2562X_ICHG_MOVE_STEP,
+		 BQ2562X_ICHRG_CURRENT_STEP_uA, BQ2562X_ICHRG_I_MIN_uA,
+		 chrg_curr_max);
 	return 0;
 }
 
 static int bq2562x_set_chrg_volt(struct bq2562x_device *bq, int chrg_volt)
 {
-	int chrg_volt_max = bq->init_data.vreg_max;
-	int chrg_volt_lsb, chrg_volt_msb, vlim;
 	int ret;
-
-	chrg_volt = clamp(chrg_volt, BQ2562X_VREG_V_MIN_uV, chrg_volt_max);
-
-	vlim = (chrg_volt / BQ2562X_VREG_V_STEP_uV)
-	       << BQ2562X_CHRG_V_LIM_MOVE_STEP;
-	chrg_volt_msb = (vlim >> 8) & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_CHRG_V_LIM_MSB, chrg_volt_msb);
-
-	chrg_volt_lsb = vlim & 0xff;
-
-	return regmap_write(bq->regmap, BQ2562X_CHRG_V_LIM_LSB, chrg_volt_lsb);
+	int chrg_volt_max = bq->init_data.vreg_max;
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_CHRG_V_LIM_LSB,
+		 "chrg volt", chrg_volt, BQ2562X_CHRG_V_LIM_MOVE_STEP,
+		 BQ2562X_VREG_V_STEP_uV, BQ2562X_VREG_V_MIN_uV, chrg_volt_max);
+	return 0;
 }
 
 static int bq2562x_get_chrg_volt(struct bq2562x_device *bq)
 {
 	int ret;
-	int chrg_volt_lsb, chrg_volt_msb, chrg_volt;
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_CHRG_V_LIM_LSB,
-		     &chrg_volt_lsb);
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_CHRG_V_LIM_MSB,
-		     &chrg_volt_msb);
-
-	chrg_volt = ((chrg_volt_msb << 8) | chrg_volt_lsb) >>
-		    BQ2562X_CHRG_V_LIM_MOVE_STEP;
-
-	return chrg_volt * BQ2562X_VREG_V_STEP_uV;
+	return RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_CHRG_V_LIM_LSB,
+			"chrg volt", BQ2562X_CHRG_V_LIM_MOVE_STEP,
+			BQ2562X_VREG_V_STEP_uV);
 }
 
 static int bq2562x_set_input_volt_lim(struct bq2562x_device *bq, int vindpm)
 {
 	int ret;
-	int vlim_lsb, vlim_msb;
-	int vlim;
-
-	vindpm =
-		clamp(vindpm, BQ2562X_VINDPM_V_MIN_uV, BQ2562X_VINDPM_V_MAX_uV);
-
-	vlim = (vindpm / BQ2562X_VINDPM_STEP_uV)
-	       << BQ2562X_INPUT_V_LIM_MOVE_STEP;
-
-	vlim_msb = (vlim >> 8) & 0xff;
-
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_INPUT_V_LIM_MSB, vlim_msb);
-
-	vlim_lsb = vlim & 0xff;
-
-	return regmap_write(bq->regmap, BQ2562X_INPUT_V_LIM_LSB, vlim_lsb);
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_INPUT_V_LIM_LSB,
+		 "input volt", vindpm, BQ2562X_INPUT_V_LIM_MOVE_STEP,
+		 BQ2562X_VINDPM_STEP_uV, BQ2562X_VINDPM_V_MIN_uV,
+		 BQ2562X_VINDPM_V_MAX_uV);
+	return 0;
 }
 
 static int bq2562x_get_input_volt_lim(struct bq2562x_device *bq)
 {
 	int ret;
-	int vlim;
-	int vlim_lsb, vlim_msb;
+	return RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_INPUT_V_LIM_LSB,
+			"input volt", BQ2562X_INPUT_V_LIM_MOVE_STEP,
+			BQ2562X_VINDPM_STEP_uV);
+}
 
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_INPUT_V_LIM_LSB,
-		     &vlim_lsb);
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_INPUT_V_LIM_MSB,
-		     &vlim_msb);
-
-	vlim = ((vlim_msb << 8) | vlim_lsb) >> BQ2562X_INPUT_V_LIM_MOVE_STEP;
-
-	return vlim * BQ2562X_VINDPM_STEP_uV;
+static int bq25622_disable_ext_ilim(struct bq2562x_device *bq, int iindpm)
+{
+	int ret = 0;
+	if (bq->device_id == BQ25622 && iindpm > bq->init_data.ext_ilim) {
+		RET_FAIL(regmap_update_bits, bq->regmap, BQ2562X_CHRG_CTRL_4,
+			 BQ2562X_EN_EXT_ILIM, 0);
+	}
+	return 0;
 }
 
 static int bq2562x_set_input_curr_lim(struct bq2562x_device *bq, int iindpm)
 {
 	int ret;
-	int ilim, ilim_lsb, ilim_msb;
+	RET_FAIL(bq2562x_set_word_unsigned, bq, BQ2562X_INPUT_I_LIM_LSB,
+		 "input curr", iindpm, BQ2562X_INPUT_I_LIM__MOVE_STEP,
+		 BQ2562X_IINDPM_STEP_uA, BQ2562X_IINDPM_I_MIN_uA,
+		 BQ2562X_IINDPM_I_MAX_uA);
+	RET_FAIL(bq25622_disable_ext_ilim, bq, iindpm);
 
-	iindpm =
-		clamp(iindpm, BQ2562X_IINDPM_I_MIN_uA, BQ2562X_IINDPM_I_MAX_uA);
-
-	ilim = (iindpm / BQ2562X_IINDPM_STEP_uA)
-	       << BQ2562X_INPUT_I_LIM__MOVE_STEP;
-
-	ilim_lsb = ilim & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_INPUT_I_LIM_LSB, ilim_lsb);
-
-	ilim_msb = (ilim >> 8) & 0xff;
-	RET_NZ(regmap_write, bq->regmap, BQ2562X_INPUT_I_LIM_MSB, ilim_msb);
-
-	return ret;
+	return 0;
 }
 
 static int bq2562x_get_input_curr_lim(struct bq2562x_device *bq)
 {
 	int ret;
-	int ilim_msb, ilim_lsb;
-	u16 ilim;
 
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_INPUT_I_LIM_LSB,
-		     &ilim_lsb);
-
-	RET_NZ_W_VAL(-1, regmap_read, bq->regmap, BQ2562X_INPUT_I_LIM_MSB,
-		     &ilim_msb);
-
-	ilim = ((ilim_msb << 8) | ilim_lsb) >> BQ2562X_INPUT_I_LIM__MOVE_STEP;
-
-	return ilim * BQ2562X_IINDPM_STEP_uA;
+	return RET_FAIL(bq2562x_get_word_unsigned, bq, BQ2562X_INPUT_I_LIM_LSB,
+			"input curr", BQ2562X_INPUT_I_LIM__MOVE_STEP,
+			BQ2562X_IINDPM_STEP_uA);
 }
 
 static int bq2562x_get_online_status(int chrg_stat_1)
@@ -615,11 +616,36 @@ static int bq2562x_get_online_status(int chrg_stat_1)
 }
 
 // start a one-shot ADC measuerement
-static int bq2562x_start_adc(struct bq2562x_device *bq)
+static int bq2562x_start_adc_oneshot(struct bq2562x_device *bq)
 {
+	int ret = 0;
+	RET_FAIL(regmap_write, bq->regmap, BQ2562X_FN_DISABE_0,
+		 BQ2562X_VPMID_ADC_DIS);
+
+	RET_FAIL(regmap_update_bits, bq->regmap, BQ2562X_ADC_CTRL,
+		 BQ2562X_ADC_AVG, 0);
+
 	return regmap_update_bits(bq->regmap, BQ2562X_ADC_CTRL,
 				  BQ2562X_ADC_RATE | BQ2562X_ADC_EN,
 				  BQ2562X_ADC_RATE | BQ2562X_ADC_EN);
+}
+
+static int bq2562x_start_adc_avg(struct bq2562x_device *bq)
+{
+	int ret = 0;
+	int adc_mask = BQ2562X_IBUS_ADC_DIS | BQ2562X_VBUS_ADC_DIS |
+		       BQ2562X_VSYS_ADC_DIS | BQ2562X_TS_ADC_DIS |
+		       BQ2562X_TDIE_ADC_DIS | BQ2562X_VPMID_ADC_DIS;
+
+	RET_FAIL(regmap_write, bq->regmap, BQ2562X_FN_DISABE_0, adc_mask);
+
+	RET_FAIL(regmap_update_bits, bq->regmap, BQ2562X_ADC_CTRL,
+		 BQ2562X_ADC_RATE, 0);
+
+	return regmap_update_bits(
+		bq->regmap, BQ2562X_ADC_CTRL,
+		BQ2562X_ADC_AVG | BQ2562X_ADC_AVG_INIT | BQ2562X_ADC_EN,
+		BQ2562X_ADC_AVG | BQ2562X_ADC_AVG_INIT | BQ2562X_ADC_EN);
 }
 
 static int bq2562x_reset_watchdog(struct bq2562x_device *bq)
@@ -635,6 +661,16 @@ static int bq2562x_reset_watchdog(struct bq2562x_device *bq)
 	       BQ2562X_WATCHDOG_MASK | BQ2562X_WD_RST,
 	       (bq->watchdog_timer_reg << BQ2562X_WATCHDOG_LSB) |
 		       BQ2562X_WD_RST);
+
+	// setup safety timer to 2 times WD
+	// if in any case the WD interrupt is missed
+	mod_timer(
+		&bq->wd_timer_safety,
+		jiffies +
+			msecs_to_jiffies(
+				bq2562x_watchdog_time[bq->watchdog_timer_reg] *
+				2));
+
 	return 0;
 }
 
@@ -646,89 +682,215 @@ static int bq2562x_update_ichrg_curr(struct bq2562x_device *bq, int *ichg)
 	return 0;
 }
 
+static int bq2562x_update_adc_now(struct bq2562x_device *bq,
+				  struct bq2562x_state *state,
+				  struct bq2562x_battery_state *bat_state)
+{
+	bat_state->vbat_adc = bq2562x_get_vbat_adc(bq);
+
+	state->vbus_adc = bq2562x_get_vbus_adc(bq);
+
+	bat_state->ibat_adc = bq2562x_get_ibat_adc(bq);
+
+	state->ibus_adc = bq2562x_get_ibus_adc(bq);
+
+	state->tdie_adc = bq2562x_get_tdie_adc(bq);
+
+	bat_state->ts_adc = bq2562x_get_ts_adc(bq);
+	return 0;
+}
+
+static int bq2562x_update_adc_avg(struct bq2562x_device *bq,
+				  struct bq2562x_battery_state *state)
+{
+	state->vbat_adc_avg = bq2562x_get_vbat_adc(bq);
+
+	state->ibat_adc_avg = bq2562x_get_ibat_adc(bq);
+
+	return 0;
+}
+
+static int
+get_power_supply_charging_state(struct bq2562x_device *bq,
+				struct bq2562x_state *state,
+				struct bq2562x_battery_state *bat_state)
+{
+	if (!state->chrg_type || (state->chrg_type == BQ2562X_OTG_MODE))
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+	else if (!state->chrg_status) {
+		if (bat_state->ibat_adc == 0 && bq2562x_get_charge_enable(bq))
+			return POWER_SUPPLY_STATUS_FULL;
+		return POWER_SUPPLY_STATUS_NOT_CHARGING;
+	}
+	return POWER_SUPPLY_STATUS_CHARGING;
+}
+
+static int bq2562x_update_battery_state(struct bq2562x_device *bq,
+					struct bq2562x_state *state,
+					struct bq2562x_battery_state *bat_state)
+{
+	int ri = 0, ri_comp = 0, charging = 0;
+	int ri_temp_comp = 100;
+	int vocv = 0;
+
+	switch (bat_state->charging_state) {
+	case POWER_SUPPLY_STATUS_FULL:
+		bat_state->curr_percent = 100;
+		break;
+	default:
+		charging = bat_state->charging_state ==
+					   POWER_SUPPLY_STATUS_CHARGING ?
+				   1 :
+				   0;
+		ri = power_supply_vbat2ri(bq->bat_info, bat_state->vbat_adc_avg,
+					  charging);
+
+		if (bq->bat_info->resist_table) {
+			ri_temp_comp = power_supply_temp2resist_simple(
+				bq->bat_info->resist_table,
+				bq->bat_info->resist_table_size,
+				bat_state->ts_adc);
+		}
+		ri_comp = ri * ri_temp_comp / 100;
+
+		// NOTE: ibat is negative when discharging!
+		// mA * mOhm = uV
+		vocv = bat_state->vbat_adc_avg -
+		       bat_state->ibat_adc_avg / 1000 * ri_comp / 1000;
+
+		// this might return -EINVAL if ocv2cap tables are not initialized
+		bat_state->curr_percent = power_supply_batinfo_ocv2cap(
+			bq->bat_info, vocv, bat_state->ts_adc);
+		// don't report 100% while we are actively charging
+		// using charger state to report correct value
+		// on initial evaluation as well
+		if (state->charging_state == POWER_SUPPLY_STATUS_CHARGING) {
+			bat_state->curr_percent =
+				min(bat_state->curr_percent, 99);
+		}
+		if (bq->emit_battery_diag) {
+			dev_info(
+				bq->dev,
+				"bat percent from ocv vbat_adc_avg:%u ibat_adc_avg:%d charging:%d ri:%d ts_adc:%u ri_temp_comp:%d ri_comp:%d vocv:%d percent:%d",
+				bat_state->vbat_adc_avg,
+				bat_state->ibat_adc_avg, charging, ri,
+				bat_state->ts_adc, ri_temp_comp, ri_comp, vocv,
+				bat_state->curr_percent);
+		}
+		break;
+	}
+	return 0;
+}
+
 static int bq2562x_update_state(struct bq2562x_device *bq,
-				struct bq2562x_state *state)
+				struct bq2562x_state *state,
+				struct bq2562x_battery_state *bat_state)
 {
 	int chrg_stat_0 = 0, chrg_stat_1 = 0, chrg_flag_0 = 0, chrg_flag_1 = 0;
 	int fault_flag_0 = 0, fault_status_0 = 0;
 	int ret = 0;
 	int val = 0;
+	u8 flags[3] = { 0, 0, 0 };
+	u8 stats[3] = { 0, 0, 0 };
+	bool adc_avg_updated = false;
+	bool adc_now_updated = false;
 
-	RET_NZ(regmap_read, bq->regmap, BQ2562X_CHRG_FLAG_0, &chrg_flag_0);
+	RET_NZ(regmap_bulk_read, bq->regmap, BQ2562X_CHRG_FLAG_0, flags, 3);
+	chrg_flag_0 = flags[0];
+	chrg_flag_1 = flags[1];
+	fault_flag_0 = flags[2];
 
-	RET_NZ(regmap_read, bq->regmap, BQ2562X_CHRG_FLAG_1, &chrg_flag_1);
-
-	RET_NZ(regmap_read, bq->regmap, BQ2562X_FAULT_FLAG_0, &fault_flag_0);
 	BQ2562X_DEBUG(
 		bq->dev,
 		"read interrupt flags chrg_flag_0:0x%02x chrg_flag_1:0x%02x fault_flag_0:0x%02x",
 		chrg_flag_0, chrg_flag_1, fault_flag_0);
 
-	if (bq->initial || chrg_flag_0) {
-		RET_NZ(regmap_read, bq->regmap, BQ2562X_CHRG_STAT_0,
-		       &chrg_stat_0);
-		BQ2562X_DEBUG(bq->dev, "read BQ2562X_CHRG_STAT_0 as 0x%02x",
-			      chrg_stat_0);
+	RET_NZ(regmap_bulk_read, bq->regmap, BQ2562X_CHRG_STAT_0, stats, 3);
+	chrg_stat_0 = stats[0];
+	chrg_stat_1 = stats[1];
+	fault_status_0 = stats[2];
 
-		if (chrg_stat_0 & BQ2562X_WD_STAT) {
-			// Watchdog expire halves the ichg
-			// set to original setpoint, and readback verify
-			bq2562x_update_ichrg_curr(bq, &state->ichg_curr);
-			bq2562x_reset_watchdog(bq);
-			// start oneshot adc on WD expire
-			bq2562x_start_adc(bq);
-		}
-		if ((chrg_flag_0 & BQ2562X_ADC_DONE) &&
-		    (chrg_stat_0 & BQ2562X_ADC_DONE)) {
-			BQ2562X_DEBUG(bq->dev, "ADC ready");
+	BQ2562X_DEBUG(
+		bq->dev,
+		"read status regs chrg_stat_0:0x%02x chrg_stat_1:0x%02x fault_status_0:0x%02x",
+		chrg_stat_0, chrg_stat_1, fault_status_0);
 
-			state->vbat_adc = bq2562x_get_vbat_adc(bq);
-
-			state->vbus_adc = bq2562x_get_vbus_adc(bq);
-
-			state->ibat_adc = bq2562x_get_ibat_adc(bq);
-
-			state->ibus_adc = bq2562x_get_ibus_adc(bq);
-		}
+	if (chrg_stat_0 & BQ2562X_WD_STAT) {
+		// process ADC averaging results
+		bq2562x_update_adc_avg(bq, bat_state);
+		adc_avg_updated = true;
+		// Watchdog expire halves the ichg
+		// set to original setpoint, and readback verify
+		bq2562x_update_ichrg_curr(bq, &state->ichg_curr);
+		bq25622_disable_ext_ilim(bq, state->ilim_curr);
+		bq2562x_reset_watchdog(bq);
+		// start oneshot adc on WD expire
+		bq2562x_start_adc_oneshot(bq);
+	}
+	if ((chrg_flag_0 & BQ2562X_ADC_DONE) &&
+	    (chrg_stat_0 & BQ2562X_ADC_DONE)) {
+		BQ2562X_DEBUG(bq->dev, "ADC ready");
+		bq2562x_update_adc_now(bq, state, bat_state);
+		adc_now_updated = true;
+		// Start averaging until the next WD expiry
+		bq2562x_start_adc_avg(bq);
+	}
+	state->ce_status = bq2562x_get_charge_enable(bq);
+	state->chrg_type = chrg_stat_1 & BQ2562X_VBUS_STAT_MSK;
+	state->online = bq2562x_get_online_status(chrg_stat_1);
+	state->chrg_status = chrg_stat_1 & BQ2562X_CHG_STAT_MSK;
+	state->charging_state =
+		get_power_supply_charging_state(bq, state, bat_state);
+	// only update battery state if any measurement has been done
+	// this prevents reporting an initial potentially 0% capacity
+	if (bat_state->vbat_adc_avg != 0 || bat_state->ibat_adc_avg != 0) {
+		bat_state->chrg_status = state->chrg_status;
+		bat_state->charging_state = state->charging_state;
 	}
 
-	if (bq->initial || chrg_flag_1) {
-		RET_NZ(regmap_read, bq->regmap, BQ2562X_CHRG_STAT_1,
-		       &chrg_stat_1);
-
-		BQ2562X_DEBUG(bq->dev, "read BQ2562X_CHRG_STAT_1 pin as 0x%02x",
-			      chrg_stat_1);
-
-		state->chrg_status = chrg_stat_1 & BQ2562X_CHG_STAT_MSK;
-		state->ce_status = bq2562x_get_charge_enable(bq);
-		state->chrg_type = chrg_stat_1 & BQ2562X_VBUS_STAT_MSK;
-		state->online = bq2562x_get_online_status(chrg_stat_1);
-		// start adc if charge status changed and not already started
-		if (!(chrg_stat_0 & BQ2562X_WD_STAT)) {
-			bq2562x_start_adc(bq);
-		}
+	// start adc if charge status changed and not already started
+	// on WD expiry
+	if (chrg_flag_1 && !(chrg_stat_0 & BQ2562X_WD_STAT)) {
+		bq2562x_start_adc_oneshot(bq);
 	}
 
-	if (bq->initial || fault_flag_0) {
-		RET_NZ(regmap_read, bq->regmap, BQ2562X_FAULT_STAT_0,
-		       &fault_status_0);
-		state->health = fault_status_0 & BQ2562X_TEMP_MASK;
-
-		state->fault_0 = fault_status_0;
-	}
+	// this is safe to update here on initial update
+	// as if there's no fault,then all reads 0 (i.e. no change)
+	bat_state->health = fault_status_0 & BQ2562X_TEMP_MASK;
+	bat_state->overvoltage = fault_status_0 & BQ2562X_BAT_FAULT_STAT;
+	state->fault_0 = fault_status_0;
 
 	if (bq->ac_detect_gpio) {
 		val = gpiod_get_value_cansleep(bq->ac_detect_gpio);
 		BQ2562X_DEBUG(bq->dev, "read ac_detect pin as %d", val);
 		state->vbus_status = val;
 	}
-	bq->initial = false;
+	// for the initial measurement use the momentary values
+	// to not report a bogus 0 percent capacity but still report
+	// battery capacity as soon as possible
+	if (bat_state->vbat_adc_avg == 0 && bat_state->ibat_adc_avg == 0 &&
+	    adc_now_updated) {
+		bat_state->vbat_adc_avg = bat_state->vbat_adc;
+		bat_state->ibat_adc_avg = bat_state->ibat_adc;
+		adc_avg_updated = true;
+	}
+	// only update battery state if we have up-to-date measurements
+	if (adc_avg_updated) {
+		bq2562x_update_battery_state(bq, state, bat_state);
+	}
 	return 0;
 }
 
 static void bq2562x_charger_reset(void *data)
 {
 	// TODO: figure out if this is needed or not
+}
+
+static void bq2562x_force_ibat_dis(struct bq2562x_device *bq, u8 val)
+{
+	regmap_update_bits(bq->regmap, BQ2562X_CHRG_CTRL_1,
+			   BQ2562X_CHRG_CTRL1_FORCE_IBATDIS,
+			   BQ2562X_CHRG_CTRL1_FORCE_IBATDIS * (val ? 1 : 0));
 }
 
 static int bq2562x_set_property(struct power_supply *psy,
@@ -740,6 +902,9 @@ static int bq2562x_set_property(struct power_supply *psy,
 	int tmp = 0;
 	switch (prop) {
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		mutex_lock(&bq->lock);
+		bq->state.ilim_curr = val->intval;
+		mutex_unlock(&bq->lock);
 		ret = RET_NZ(bq2562x_set_input_curr_lim, bq, val->intval);
 		break;
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
@@ -775,7 +940,6 @@ static int bq2562x_get_property(struct power_supply *psy,
 	struct bq2562x_device *bq = power_supply_get_drvdata(psy);
 	struct bq2562x_state state;
 	int ret = 0;
-	BQ2562X_DEBUG(bq->dev, "bq2562x_get_property prop: 0x%08x", psp);
 
 	mutex_lock(&bq->lock);
 	state = bq->state;
@@ -783,25 +947,9 @@ static int bq2562x_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
-		BQ2562X_DEBUG(
-			bq->dev,
-			"POWER_SUPPLY_PROP_STATUS chrg_type 0x%02x charge status 0x%02x ibat %d",
-			state.chrg_type, state.chrg_status, state.ibat_adc);
-
-		if (!state.chrg_type || (state.chrg_type == BQ2562X_OTG_MODE))
-			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
-		else if (!state.chrg_status) {
-			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
-			if (state.ibat_adc == 0)
-				val->intval = POWER_SUPPLY_STATUS_FULL;
-		} else
-			val->intval = POWER_SUPPLY_STATUS_CHARGING;
+		val->intval = state.charging_state;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
-		BQ2562X_DEBUG(
-			bq->dev,
-			"POWER_SUPPLY_PROP_CHARGE_TYPE charge status 0x%02x",
-			state.chrg_status);
 		switch (state.chrg_status) {
 		case BQ2562X_TRICKLE_CHRG:
 			val->intval = POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
@@ -849,33 +997,14 @@ static int bq2562x_get_property(struct power_supply *psy,
 		break;
 
 	case POWER_SUPPLY_PROP_HEALTH:
-		if (state.fault_0 &
-		    (BQ2562X_OTG_FAULT_STAT | BQ2562X_SYS_FAULT_STAT))
+		if (state.fault_0 & BQ2562X_TSHUT_FAULT_STAT) {
+			val->intval = POWER_SUPPLY_HEALTH_OVERHEAT;
+		} else if (state.fault_0 &
+			   (BQ2562X_OTG_FAULT_STAT | BQ2562X_SYS_FAULT_STAT |
+			    BQ2562X_VSYS_FAULT_STAT)) {
 			val->intval = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
-		else
+		} else {
 			val->intval = POWER_SUPPLY_HEALTH_GOOD;
-
-		switch (state.health) {
-		case BQ2562X_TEMP_TS_NORMAL:
-			val->intval = POWER_SUPPLY_HEALTH_GOOD;
-			break;
-		case BQ2562X_TEMP_HOT:
-			val->intval = POWER_SUPPLY_HEALTH_HOT;
-			break;
-		case BQ2562X_TEMP_WARM:
-		case BQ2562X_TEMP_PREWARM:
-			val->intval = POWER_SUPPLY_HEALTH_WARM;
-			break;
-		case BQ2562X_TEMP_COOL:
-		case BQ2562X_TEMP_PRECOOL:
-			val->intval = POWER_SUPPLY_HEALTH_COOL;
-			break;
-		case BQ2562X_TEMP_COLD:
-			val->intval = POWER_SUPPLY_HEALTH_COLD;
-			break;
-		case BQ2562X_TEMP_PIN_BIAS_REFER_FAULT:
-			val->intval = POWER_SUPPLY_HEALTH_DEAD;
-			break;
 		}
 		break;
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
@@ -907,6 +1036,15 @@ static int bq2562x_get_property(struct power_supply *psy,
 		ret = RET_FAIL(bq2562x_get_input_curr_lim, bq);
 		val->intval = ret;
 		break;
+	case POWER_SUPPLY_PROP_TEMP:
+		val->intval = state.tdie_adc;
+		break;
+	case POWER_SUPPLY_PROP_TEMP_MIN:
+		val->intval = BQ2562X_TEMP_MIN_01C;
+		break;
+	case POWER_SUPPLY_PROP_TEMP_MAX:
+		val->intval = BQ2562X_TEMP_MAX_01C;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -919,16 +1057,54 @@ static int bq2562x_battery_get_property(struct power_supply *psy,
 					union power_supply_propval *val)
 {
 	struct bq2562x_device *bq = power_supply_get_drvdata(psy);
-	struct bq2562x_state state;
+	struct bq2562x_battery_state state;
 	int ret = 0;
-	BQ2562X_DEBUG(bq->dev, "bq2562x_battery_get_property prop: 0x%08x",
-		      psp);
 
 	mutex_lock(&bq->lock);
-	state = bq->state;
+	state = bq->bat_state;
 	mutex_unlock(&bq->lock);
-
+	BQ2562X_DEBUG(bq->dev, "bat get property:%d", psp);
 	switch (psp) {
+	case POWER_SUPPLY_PROP_PRESENT:
+		BQ2562X_DEBUG(bq->dev, "bat get property present:%d",
+			      state.present);
+		val->intval = state.present;
+		break;
+	case POWER_SUPPLY_PROP_STATUS:
+		val->intval = state.charging_state;
+		break;
+	case POWER_SUPPLY_PROP_HEALTH:
+		if (state.overvoltage) {
+			// TODO: differentiate between overvoltage and
+			// overcurrent if possible
+			val->intval = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
+		} else {
+			switch (state.health) {
+			case BQ2562X_TEMP_TS_NORMAL:
+				val->intval = POWER_SUPPLY_HEALTH_GOOD;
+				break;
+			case BQ2562X_TEMP_HOT:
+				val->intval = POWER_SUPPLY_HEALTH_HOT;
+				break;
+			case BQ2562X_TEMP_WARM:
+			case BQ2562X_TEMP_PREWARM:
+				val->intval = POWER_SUPPLY_HEALTH_WARM;
+				break;
+			case BQ2562X_TEMP_COOL:
+			case BQ2562X_TEMP_PRECOOL:
+				val->intval = POWER_SUPPLY_HEALTH_COOL;
+				break;
+			case BQ2562X_TEMP_COLD:
+				val->intval = POWER_SUPPLY_HEALTH_COLD;
+				break;
+			case BQ2562X_TEMP_PIN_BIAS_REFER_FAULT:
+				val->intval = POWER_SUPPLY_HEALTH_DEAD;
+				break;
+			default:
+				val->intval = POWER_SUPPLY_HEALTH_UNKNOWN;
+			}
+		}
+		break;
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
 		val->intval = bq->init_data.ichg_max;
 		break;
@@ -940,6 +1116,23 @@ static int bq2562x_battery_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		val->intval = state.ibat_adc;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_AVG:
+		val->intval = state.vbat_adc_avg;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_AVG:
+		val->intval = state.ibat_adc_avg;
+		break;
+	case POWER_SUPPLY_PROP_TEMP:
+		val->intval = state.ts_adc;
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+		BQ2562X_DEBUG(bq->dev, "bat get property capacity:%d",
+			      state.curr_percent);
+		val->intval = state.curr_percent;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+		val->intval = bq->init_data.bat_cap;
 		break;
 	default:
 		return -EINVAL;
@@ -960,40 +1153,105 @@ static bool bq2562x_state_changed(struct bq2562x_device *bq,
 	return memcmp(&old_state, new_state, sizeof(struct bq2562x_state)) != 0;
 }
 
+static bool bq2562x_bat_state_changed(struct bq2562x_device *bq,
+				      struct bq2562x_battery_state *new_state)
+{
+	struct bq2562x_battery_state old_state;
+
+	mutex_lock(&bq->lock);
+	old_state = bq->bat_state;
+	mutex_unlock(&bq->lock);
+
+	return memcmp(&old_state, new_state,
+		      sizeof(struct bq2562x_battery_state)) != 0;
+}
+
+static int
+bq2562x_initial_charge_enable(struct bq2562x_device *bq,
+			      struct bq2562x_state *state,
+			      struct bq2562x_battery_state *bat_state)
+{
+	u8 flags[3] = { 0, 0, 0 };
+	int bat_present = 0;
+	regmap_bulk_read(bq->regmap, BQ2562X_CHRG_FLAG_0, flags, 3);
+
+	BQ2562X_DEBUG(
+		bq->dev,
+		"read interrupt flags for init state:%d chrg_flag_0:0x%02x chrg_flag_1:0x%02x fault_flag_0:0x%02x",
+		state->state, flags[0], flags[1], flags[2]);
+
+	bq2562x_update_adc_now(bq, state, bat_state);
+
+	bq2562x_force_ibat_dis(bq, state->state != BQ2562X_STATE_IBAT_DIS_ADC2);
+
+	bat_present = state->state == BQ2562X_STATE_IBAT_DIS_ADC2 &&
+				      bat_state->vbat_adc >=
+					      BQ25622_VBAT_UVLO_uV ?
+			      1 :
+			      0;
+	bq2562x_set_charge_enable(bq, bat_present);
+
+	bat_state->present = bat_present;
+	state->state += 1;
+
+	bq2562x_reset_watchdog(bq);
+	bq2562x_start_adc_oneshot(bq);
+	return 0;
+}
+
 static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
 {
 	struct bq2562x_device *bq = private;
 	struct bq2562x_state state;
+	struct bq2562x_battery_state bat_state;
 	int ret;
 	BQ2562X_DEBUG(bq->dev, "bq2562x_irq_handler_thread irq: 0x%08x", irq);
 	// starting off with the previous state
 	mutex_lock(&bq->lock);
 	state = bq->state;
+	bat_state = bq->bat_state;
 	mutex_unlock(&bq->lock);
 
-	ret = bq2562x_update_state(bq, &state);
-	if (ret)
+	// Battery detection on initial startup
+	// to determine charge enable and battery presence
+	if (state.state < BQ2562X_STATE_OPERATIONAL) {
+		bq2562x_initial_charge_enable(bq, &state, &bat_state);
+		mutex_lock(&bq->lock);
+		bq->state = state;
+		bq->bat_state = bat_state;
+		mutex_unlock(&bq->lock);
 		goto irq_out;
+	}
 
-	if (!bq2562x_state_changed(bq, &state))
+	ret = bq2562x_update_state(bq, &state, &bat_state);
+	if (ret) {
+		dev_err(bq->dev, "error updating battery state");
 		goto irq_out;
-	BQ2562X_DEBUG(bq->dev, "bq2562x_irq_handler_thread state changed");
+	}
 
-	mutex_lock(&bq->lock);
-	bq->state = state;
-	mutex_unlock(&bq->lock);
-	power_supply_changed(bq->charger);
+	if (bq2562x_state_changed(bq, &state)) {
+		BQ2562X_DEBUG(bq->dev,
+			      "bq2562x_irq_handler_thread state changed");
+		mutex_lock(&bq->lock);
+		bq->state = state;
+		mutex_unlock(&bq->lock);
+		power_supply_changed(bq->charger);
+	}
+
+	if (bq2562x_bat_state_changed(bq, &bat_state)) {
+		BQ2562X_DEBUG(
+			bq->dev,
+			"bq2562x_irq_handler_thread battery state changed");
+		mutex_lock(&bq->lock);
+		bq->bat_state = bat_state;
+		mutex_unlock(&bq->lock);
+		power_supply_changed(bq->battery);
+	}
 
 irq_out:
 	return IRQ_HANDLED;
 }
 
-// TODO: add charge enable property
-/*
-	POWER_SUPPLY_PROP_CHARGE_ENABLED,
-	POWER_SUPPLY_PROP_BATTERY_CHARGING_ENABLED,
-	POWER_SUPPLY_PROP_CHARGING_ENABLED,
-*/
 static enum power_supply_property bq2562x_power_supply_props[] = {
 	POWER_SUPPLY_PROP_MANUFACTURER,
 	POWER_SUPPLY_PROP_MODEL_NAME,
@@ -1010,15 +1268,24 @@ static enum power_supply_property bq2562x_power_supply_props[] = {
 	POWER_SUPPLY_PROP_CHARGE_TYPE,
 	POWER_SUPPLY_PROP_USB_TYPE,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
-
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_TEMP_MIN,
+	POWER_SUPPLY_PROP_TEMP_MAX,
 };
 
-/* TODO: add battery temperature reading */
 static enum power_supply_property bq2562x_battery_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_VOLTAGE_AVG,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CURRENT_AVG,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_TEMP,
 };
 
 static int bq2562x_property_is_writeable(struct power_supply *psy,
@@ -1063,9 +1330,11 @@ static bool bq2562x_is_volatile_reg(struct device *dev, unsigned int reg)
 	case BQ2562X_CHRG_STAT_0 ... BQ2562X_FAULT_FLAG_0:
 	case BQ2562X_ADC_IBUS_LSB ... BQ2562X_ADC_TDIE_MSB:
 	case BQ2562X_CHRG_CTRL_1:
+	case BQ2562X_CHRG_CTRL_4:
 	case BQ2562X_CHRG_I_LIM_LSB:
 	case BQ2562X_CHRG_I_LIM_MSB:
 	case BQ2562X_ADC_CTRL:
+	case BQ2562X_PART_INFO:
 		return true;
 	default:
 		return false;
@@ -1110,81 +1379,185 @@ static int bq2562x_power_supply_init(struct bq2562x_device *bq,
 	return 0;
 }
 
-static int bq2562x_hw_init(struct bq2562x_device *bq)
+static void bq2562x_wd_safety_timer(struct timer_list *timer)
 {
-	struct power_supply_battery_info *bat_info;
-	struct power_supply_battery_info default_bat_info = {};
+	struct bq2562x_device *bq =
+		container_of(timer, struct bq2562x_device, wd_timer_safety);
+	schedule_work(&bq->wd_safety_work);
+}
+
+static void bq2562x_wd_safety_timer_work(struct work_struct *work)
+{
+	struct bq2562x_device *bq =
+		container_of(work, struct bq2562x_device, wd_safety_work);
+	dev_warn(bq->dev,
+		 "missed watchdog interrupt, resetting watchdog manually");
+	bq2562x_reset_watchdog(bq);
+}
+
+static int bq2562x_map_wd_to_reg(struct bq2562x_device *bq)
+{
+	int i = 0;
 	int wd_reg_val = BQ2562X_WATCHDOG_DIS;
 	int wd_max_val = BQ2562X_NUM_WD_VAL - 1;
-	int ret = 0;
-	int i;
-	bq->initial = true;
-
-	if (bq->watchdog_timer) {
-		if (bq->watchdog_timer >= bq2562x_watchdog_time[wd_max_val])
-			wd_reg_val = wd_max_val;
-		else {
-			for (i = 0; i < wd_max_val; i++) {
-				if (bq->watchdog_timer >=
-					    bq2562x_watchdog_time[i] &&
-				    bq->watchdog_timer <
-					    bq2562x_watchdog_time[i + 1]) {
-					wd_reg_val = i;
-					break;
-				}
+	if (bq->watchdog_timer >= bq2562x_watchdog_time[wd_max_val])
+		wd_reg_val = wd_max_val;
+	else {
+		for (i = 0; i < wd_max_val; i++) {
+			if (bq->watchdog_timer >= bq2562x_watchdog_time[i] &&
+			    bq->watchdog_timer < bq2562x_watchdog_time[i + 1]) {
+				wd_reg_val = i;
+				break;
 			}
 		}
 	}
-	bq->watchdog_timer_reg = wd_reg_val;
+	if (wd_reg_val == BQ2562X_WATCHDOG_DIS) {
+		dev_err(bq->dev,
+			"failed to map watchdog timer %d to watchdog reg value",
+			bq->watchdog_timer);
+		return -EINVAL;
+	}
+	return wd_reg_val;
+}
 
+static int
+bq2562x_parse_battery_dt_vbat_to_ri(struct bq2562x_device *bq,
+				    const char *const key,
+				    struct device_node *battery_np, int *size,
+				    struct power_supply_vbat_ri_table **table)
+{
+	int len, index;
+	const __be32 *list = of_get_property(battery_np, key, &len);
+	if (list && len) {
+		*size = len / (2 * sizeof(__be32));
+
+		*table = devm_kcalloc(&bq->charger->dev, *size,
+				      sizeof(struct power_supply_vbat_ri_table),
+				      GFP_KERNEL);
+
+		if (!*table) {
+			return -ENOMEM;
+		}
+
+		for (index = 0; index < *size; index++) {
+			(*table)[index].vbat_uv = be32_to_cpu(*list++);
+			(*table)[index].ri_uohm = be32_to_cpu(*list++);
+		}
+	}
+	return 0;
+}
+
+// power_supply_core.c doesn't parse crucial attributes
+// for the simple battery. this function parses those attributes
+static int bq2562x_fixup_battery_info(struct bq2562x_device *bq)
+{
+	struct device_node *battery_np = NULL;
+	struct fwnode_handle *fwnode = NULL;
+	int err = 0;
+	struct fwnode_reference_args args;
+
+	if (bq->charger->of_node) {
+		battery_np = of_parse_phandle(bq->charger->of_node,
+					      "monitored-battery", 0);
+		if (!battery_np)
+			return -ENODEV;
+
+		fwnode = fwnode_handle_get(of_fwnode_handle(battery_np));
+	} else if (bq->charger->dev.parent) {
+		err = fwnode_property_get_reference_args(
+			dev_fwnode(bq->charger->dev.parent),
+			"monitored-battery", NULL, 0, 0, &args);
+		if (err)
+			return err;
+
+		fwnode = args.fwnode;
+	}
+	if (!fwnode)
+		return -ENOENT;
+
+	// internal resistance charging
+	fwnode_property_read_u32(
+		fwnode, "factory-internal-resistance-charging-micro-ohms",
+		&bq->bat_info->factory_internal_resistance_uohm);
+
+	err = bq2562x_parse_battery_dt_vbat_to_ri(
+		bq, "vbat-to-internal-resistance-charging-table", battery_np,
+		&bq->bat_info->vbat2ri_charging_size,
+		&bq->bat_info->vbat2ri_charging);
+	if (err)
+		goto out_put_node;
+
+	err = bq2562x_parse_battery_dt_vbat_to_ri(
+		bq, "vbat-to-internal-resistance-discharging-table", battery_np,
+		&bq->bat_info->vbat2ri_discharging_size,
+		&bq->bat_info->vbat2ri_discharging);
+
+out_put_node:
+	fwnode_handle_put(fwnode);
+	of_node_put(battery_np);
+	return err;
+}
+
+static int bq2562x_hw_init(struct bq2562x_device *bq)
+{
+	int ret = 0;
+
+	dev_info(bq->dev, "Initializing BQ25620/22 HW ...");
+
+	timer_setup(&bq->wd_timer_safety, bq2562x_wd_safety_timer, 0);
+	INIT_WORK(&bq->wd_safety_work, bq2562x_wd_safety_timer_work);
+	bq->wd_timer_safety_initialized = true;
+
+	// do a REG reset first, just be sure that we start from
+	// the well knwon state
+	RET_NZ(regmap_update_bits, bq->regmap, BQ2562X_CHRG_CTRL_2,
+	       BQ2562X_CHRG_CTRL2_REG_RST, BQ2562X_CHRG_CTRL2_REG_RST);
+
+	bq->watchdog_timer_reg = RET_FAIL(bq2562x_map_wd_to_reg, bq);
 	RET_NZ(bq2562x_reset_watchdog, bq);
 
-	ret = power_supply_get_battery_info(bq->charger, &bat_info);
-	if (ret) {
-		dev_warn(
-			bq->dev,
-			"battery info missing, default values will be applied\n");
-		bat_info = &default_bat_info;
-		default_bat_info.constant_charge_current_max_ua =
-			BQ2562X_ICHRG_I_DEF_uA;
+	RET_NZ(power_supply_get_battery_info, bq->charger, &bq->bat_info);
 
-		default_bat_info.constant_charge_voltage_max_uv =
-			BQ2562X_VREG_V_DEF_uV;
+	RET_NZ(bq2562x_fixup_battery_info, bq);
 
-		default_bat_info.precharge_current_ua =
-			BQ2562X_PRECHRG_I_DEF_uA;
-		default_bat_info.charge_term_current_ua =
-			BQ2562X_TERMCHRG_I_DEF_uA;
-		bq->init_data.ichg_max = BQ2562X_ICHRG_I_MAX_uA;
-		bq->init_data.vreg_max = BQ2562X_VREG_V_MAX_uV;
-	} else {
-		bq->init_data.ichg_max =
-			bat_info->constant_charge_current_max_ua;
-
-		bq->init_data.vreg_max =
-			bat_info->constant_charge_voltage_max_uv;
+	switch (bq->bat_info->technology) {
+	case POWER_SUPPLY_TECHNOLOGY_LION:
+	case POWER_SUPPLY_TECHNOLOGY_LIPO:
+	case POWER_SUPPLY_TECHNOLOGY_LiFe:
+	case POWER_SUPPLY_TECHNOLOGY_LiMn:
+		dev_info(bq->dev, "battery technology is:%d",
+			 bq->bat_info->technology);
+		break;
+	default:
+		dev_err(bq->dev, "unsupported battery technology:%d",
+			bq->bat_info->technology);
+		return -EINVAL;
 	}
 
+	bq->init_data.ichg_max = bq->bat_info->constant_charge_current_max_ua;
+	bq->init_data.vreg_max = bq->bat_info->constant_charge_voltage_max_uv;
+	bq->init_data.bat_cap = bq->bat_info->charge_full_design_uah;
+
+	bq->bat_state.curr_percent = 0;
 	// initialize charge current
 	bq->state.ichg_curr = bq->init_data.ichg_max;
 	RET_NZ(bq2562x_set_ichrg_curr, bq, bq->init_data.ichg_max);
-	RET_NZ(bq2562x_set_prechrg_curr, bq, bat_info->precharge_current_ua);
+	RET_NZ(bq2562x_set_prechrg_curr, bq,
+	       bq->bat_info->precharge_current_ua);
 	RET_NZ(bq2562x_set_chrg_volt, bq,
-	       bat_info->constant_charge_voltage_max_uv);
+	       bq->bat_info->constant_charge_voltage_max_uv);
 
-	RET_NZ(bq2562x_set_term_curr, bq, bat_info->charge_term_current_ua);
+	RET_NZ(bq2562x_set_term_curr, bq, bq->bat_info->charge_term_current_ua);
 
 	RET_NZ(bq2562x_set_input_volt_lim, bq, bq->init_data.vlim);
 
 	RET_NZ(bq2562x_set_input_curr_lim, bq, bq->init_data.ilim);
+	bq->state.ilim_curr = bq->init_data.ilim;
 
-	power_supply_put_battery_info(bq->charger, bat_info);
+	RET_NZ(bq2562x_start_adc_oneshot, bq);
 
-	// TODO: add battery detection with Force IBAT discharge
-	// Enable chargin by default
-	RET_NZ(bq2562x_set_charge_enable, bq, 1);
-
-	RET_NZ(bq2562x_start_adc, bq);
+	bq->bat_state.charging_state = bq->state.charging_state =
+		POWER_SUPPLY_STATUS_UNKNOWN;
 
 	return 0;
 }
@@ -1194,18 +1567,24 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 			    struct device *dev)
 {
 	int ret = 0;
+	u32 ext_ilim_r = 0;
 
 	psy_cfg->drv_data = bq;
 	psy_cfg->of_node = dev->of_node;
 
 	ret = device_property_read_u32(bq->dev, "ti,watchdog-timeout-ms",
 				       &bq->watchdog_timer);
-	if (ret)
-		bq->watchdog_timer = BQ2562X_WATCHDOG_DIS;
+	if (ret) {
+		dev_err(bq->dev, "failed to read watchdog dt property");
+		return -EINVAL;
+	}
 
 	if (bq->watchdog_timer > BQ2562X_WATCHDOG_MAX ||
-	    bq->watchdog_timer < BQ2562X_WATCHDOG_DIS)
+	    bq->watchdog_timer < BQ2562X_WATCHDOG_DIS) {
+		dev_err(bq->dev, "invalid watchdog timer setting: %d",
+			bq->watchdog_timer);
 		return -EINVAL;
+	}
 
 	ret = device_property_read_u32(bq->dev, "input-voltage-limit-microvolt",
 				       &bq->init_data.vlim);
@@ -1225,6 +1604,36 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 	    bq->init_data.ilim < BQ2562X_IINDPM_I_MIN_uA)
 		return -EINVAL;
 
+	if (bq->device_id == BQ25622) {
+		ret = device_property_read_u32(bq->dev, "ext-ilim-resistor",
+					       &ext_ilim_r);
+		// using a uA value here requires 64bit math
+		// keeping in mA, then scaling it up to uA
+		bq->init_data.ext_ilim =
+			BQ25622_K_ILIM_mA_MAX / ext_ilim_r * 1000;
+		if (ret || ext_ilim_r == 0 || bq->init_data.ext_ilim == 0) {
+			return -EINVAL;
+		}
+	}
+	// TODO: add overflow check and return -EINVAL
+	ret = device_property_read_u32(bq->dev, "ti,ts-adc-coeff-a",
+				       &bq->ts_coeff_a);
+	if (ret)
+		bq->ts_coeff_a = BQ2562X_TS_ADC_COEFF_A_DEF;
+
+	ret = device_property_read_u32(bq->dev, "ti,ts-adc-coeff-b",
+				       &bq->ts_coeff_b);
+	if (ret)
+		bq->ts_coeff_b = BQ2562X_TS_ADC_COEFF_B_DEF;
+
+	ret = device_property_read_u32(bq->dev, "ti,ts-adc-coeff-scale",
+				       &bq->ts_coeff_scale);
+	if (ret)
+		bq->ts_coeff_scale = BQ2562X_TS_ADC_COEFF_SCALE_DEF;
+
+	dev_info(bq->dev, "TS ADC coefficients a=%u b=%u scale=%u",
+		 bq->ts_coeff_a, bq->ts_coeff_b, bq->ts_coeff_scale);
+
 	bq->ac_detect_gpio =
 		devm_gpiod_get_optional(bq->dev, "ac-detect", GPIOD_IN);
 	if (IS_ERR(bq->ac_detect_gpio)) {
@@ -1232,14 +1641,31 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 		dev_err(bq->dev, "Failed to get ac detect");
 		return ret;
 	}
-	// startup with charging disable
-	bq->ce_gpio = devm_gpiod_get_optional(bq->dev, "charge-enable",
-					      GPIOD_OUT_LOW);
-	if (IS_ERR(bq->ce_gpio)) {
-		ret = PTR_ERR(bq->ce_gpio);
-		dev_err(bq->dev, "Failed to get ce");
-		return ret;
+
+	// can be used to emit battery percentage calculation diagnostics
+	// that can be used to calibrate a battery
+	bq->emit_battery_diag =
+		device_property_read_bool(bq->dev, "emit-battery-diag");
+
+	bq->ce_pin_override =
+		device_property_read_bool(bq->dev, "charge-enable-override");
+	if (bq->ce_pin_override) {
+		dev_info(bq->dev,
+			 "ce pin override specified, won't use ce gpio");
+		bq->ce_gpio = NULL;
+	} else {
+		// startup with charging disable
+		bq->ce_gpio = devm_gpiod_get_optional(bq->dev, "charge-enable",
+						      GPIOD_OUT_LOW);
+		if (IS_ERR(bq->ce_gpio)) {
+			ret = PTR_ERR(bq->ce_gpio);
+			dev_err(bq->dev, "Failed to get ce");
+			return ret;
+		}
 	}
+
+	bq->ce_pin_negate =
+		device_property_read_bool(bq->dev, "charge-enable-negate");
 
 	return 0;
 }
@@ -1290,7 +1716,13 @@ static int bq2562x_probe(struct i2c_client *client,
 	// need to allocate power supply before registering interrupt
 	RET_NZ(bq2562x_power_supply_init, bq, &psy_cfg, dev);
 
-	RET_NZ(bq2562x_hw_init, bq);
+	// NOTE: timer is potentialy setup in this func
+	// need to clean up if anything fails from here
+	ret = bq2562x_hw_init(bq);
+	if (ret) {
+		dev_err(dev, "failed to initialize HW: %d", ret);
+		goto err;
+	}
 
 	// last step to setup IRQ, as it can be called as soon as
 	// this returns, resulting in uninitialized state
@@ -1301,11 +1733,24 @@ static int bq2562x_probe(struct i2c_client *client,
 			dev_name(&client->dev), bq);
 		if (ret < 0) {
 			dev_err(dev, "get irq fail: %d\n", ret);
-			return ret;
+			goto err;
 		}
 	}
 
-	return ret;
+	return 0;
+err:
+	if (bq->wd_timer_safety_initialized) {
+		del_timer_sync(&bq->wd_timer_safety);
+		cancel_work_sync(&bq->wd_safety_work);
+	}
+	return -EPERM;
+}
+
+static void bq2562x_remove(struct i2c_client *client)
+{
+	struct bq2562x_device *bq = i2c_get_clientdata(client);
+	del_timer_sync(&bq->wd_timer_safety);
+	cancel_work_sync(&bq->wd_safety_work);
 }
 
 static const struct i2c_device_id bq2562x_i2c_ids[] = {
@@ -1341,6 +1786,7 @@ static struct i2c_driver bq2562x_driver = {
             .acpi_match_table = bq2562x_acpi_match,
         },
     .probe = bq2562x_probe,
+	.remove = bq2562x_remove,
     .id_table = bq2562x_i2c_ids,
 };
 module_i2c_driver(bq2562x_driver);
