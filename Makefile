@@ -40,7 +40,7 @@ deploy: all
 	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- sudo dpkg -r mrhat-bq25622
 	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- sudo dpkg -i /tmp/mrhat-bq25622_$(VERSION)-1_armhf.deb
 	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- sudo sed -ri '/^\s*dtoverlay=mrhat-bq25622/d' /boot/config.txt
-	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- "echo 'dtoverlay=mrhat-bq25622' | sudo tee -a /boot/config.txt"
+	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- "echo 'dtoverlay=mrhat-bq25622:battery_diag=true' | sudo tee -a /boot/config.txt"
 
 quickdeploy: driver
 	scp mrhat-bq25622/lib/modules/$(KVER)/bq2562x_charger.ko $(TARGET):/tmp/

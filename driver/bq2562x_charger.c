@@ -2,6 +2,7 @@
 // BQ2562X driver
 // Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com/
 
+#include <linux/err.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
@@ -155,6 +156,7 @@ struct bq2562x_device {
 	bool ce_pin_override;
 	// ce pin is active low
 	bool ce_pin_negate;
+	bool emit_battery_diag;
 };
 
 /* clang-format off */
@@ -726,7 +728,7 @@ get_power_supply_charging_state(struct bq2562x_device *bq,
 static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 					struct bq2562x_battery_state *bat_state)
 {
-	int ri = 0;
+	int ri = 0, ri_comp = 0, charging = 0;
 	int ri_temp_comp = 100;
 	int vocv = 0;
 
@@ -735,41 +737,43 @@ static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 		bat_state->curr_percent = 100;
 		break;
 	default:
+		charging = bat_state->charging_state ==
+					   POWER_SUPPLY_STATUS_CHARGING ?
+				   1 :
+				   0;
 		ri = power_supply_vbat2ri(bq->bat_info, bat_state->vbat_adc_avg,
-					  bat_state->charging_state ==
-						  POWER_SUPPLY_STATUS_CHARGING);
-		BQ2562X_DEBUG(
-			bq->dev,
-			"power_supply_vbat2ri vbat_adc_avg:%u charging:%d ri:%d",
-			bat_state->vbat_adc_avg,
-			bat_state->charging_state ==
-				POWER_SUPPLY_STATUS_CHARGING,
-			ri);
+					  charging);
+
 		if (bq->bat_info->resist_table) {
 			ri_temp_comp = power_supply_temp2resist_simple(
 				bq->bat_info->resist_table,
 				bq->bat_info->resist_table_size,
 				bat_state->ts_adc);
-			BQ2562X_DEBUG(
-				bq->dev,
-				"ri temperature compensation at ts_adc: %u is ri_temp_comp:%d",
-				bat_state->ts_adc, ri_temp_comp);
 		}
-		ri = ri * ri_temp_comp / 100;
+		ri_comp = ri * ri_temp_comp / 100;
 
 		// NOTE: ibat is negative when discharging!
 		// mA * mOhm = uV
 		vocv = bat_state->vbat_adc_avg -
-		       bat_state->ibat_adc_avg / 1000 * ri / 1000;
+		       bat_state->ibat_adc_avg / 1000 * ri_comp / 1000;
 
 		// this might return -EINVAL if ocv2cap tables are not initialized
 		bat_state->curr_percent = power_supply_batinfo_ocv2cap(
 			bq->bat_info, vocv, bat_state->ts_adc);
-
-		BQ2562X_DEBUG(
-			bq->dev,
-			"bat percent from ocv:%u at ts_adc: %u with ri:%d is curr_percent:%d",
-			vocv, bat_state->ts_adc, ri, bat_state->curr_percent);
+		// don't report 100% while we are actively charging
+		if (charging) {
+			bat_state->curr_percent =
+				min(bat_state->curr_percent, 99);
+		}
+		if (bq->emit_battery_diag) {
+			dev_info(
+				bq->dev,
+				"bat percent from ocv vbat_adc_avg:%u ibat_adc_avg:%d charging:%d ri:%d ts_adc:%u ri_temp_comp:%d ri_comp:%d percent:%d",
+				bat_state->vbat_adc_avg,
+				bat_state->ibat_adc_avg, charging, ri,
+				bat_state->ts_adc, ri_temp_comp, ri_comp,
+				bat_state->curr_percent);
+		}
 		break;
 	}
 	return 0;
@@ -785,6 +789,8 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 	int val = 0;
 	u8 flags[3] = { 0, 0, 0 };
 	u8 stats[3] = { 0, 0, 0 };
+	bool adc_avg_updated = false;
+	bool adc_now_updated = false;
 
 	RET_NZ(regmap_bulk_read, bq->regmap, BQ2562X_CHRG_FLAG_0, flags, 3);
 	chrg_flag_0 = flags[0];
@@ -809,6 +815,7 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 	if (chrg_stat_0 & BQ2562X_WD_STAT) {
 		// process ADC averaging results
 		bq2562x_update_adc_avg(bq, bat_state);
+		adc_avg_updated = true;
 		// Watchdog expire halves the ichg
 		// set to original setpoint, and readback verify
 		bq2562x_update_ichrg_curr(bq, &state->ichg_curr);
@@ -821,22 +828,31 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 	    (chrg_stat_0 & BQ2562X_ADC_DONE)) {
 		BQ2562X_DEBUG(bq->dev, "ADC ready");
 		bq2562x_update_adc_now(bq, state, bat_state);
+		adc_now_updated = true;
 		// Start averaging until the next WD expiry
 		bq2562x_start_adc_avg(bq);
 	}
-
-	bat_state->chrg_status = state->chrg_status = chrg_stat_1 &
-						      BQ2562X_CHG_STAT_MSK;
 	state->ce_status = bq2562x_get_charge_enable(bq);
 	state->chrg_type = chrg_stat_1 & BQ2562X_VBUS_STAT_MSK;
 	state->online = bq2562x_get_online_status(chrg_stat_1);
-	bat_state->charging_state = state->charging_state =
+	state->chrg_status = chrg_stat_1 & BQ2562X_CHG_STAT_MSK;
+	state->charging_state =
 		get_power_supply_charging_state(bq, state, bat_state);
+	// only update battery state if any measurement has been done
+	// this prevents reporting an initial potentially 0% capacity
+	if (bat_state->vbat_adc_avg != 0 || bat_state->ibat_adc_avg != 0) {
+		bat_state->chrg_status = state->chrg_status;
+		bat_state->charging_state = state->charging_state;
+	}
+
 	// start adc if charge status changed and not already started
+	// on WD expiry
 	if (chrg_flag_1 && !(chrg_stat_0 & BQ2562X_WD_STAT)) {
 		bq2562x_start_adc_oneshot(bq);
 	}
 
+	// this is safe to update here on initial update
+	// as if there's no fault,then all reads 0 (i.e. no change)
 	bat_state->health = fault_status_0 & BQ2562X_TEMP_MASK;
 	bat_state->overvoltage = fault_status_0 & BQ2562X_BAT_FAULT_STAT;
 	state->fault_0 = fault_status_0;
@@ -847,12 +863,18 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 		state->vbus_status = val;
 	}
 	// for the initial measurement use the momentary values
-	// to not report a bogus 0 percent capacity
-	if (bat_state->vbat_adc_avg == 0 && bat_state->ibat_adc_avg == 0) {
+	// to not report a bogus 0 percent capacity but still report
+	// battery capacity as soon as possible
+	if (bat_state->vbat_adc_avg == 0 && bat_state->ibat_adc_avg == 0 &&
+	    adc_now_updated) {
 		bat_state->vbat_adc_avg = bat_state->vbat_adc;
 		bat_state->ibat_adc_avg = bat_state->ibat_adc;
+		adc_avg_updated = true;
 	}
-	bq2562x_update_battery_state(bq, bat_state);
+	// only update battery state if we have up-to-date measurements
+	if (adc_avg_updated) {
+		bq2562x_update_battery_state(bq, bat_state);
+	}
 	return 0;
 }
 
@@ -1038,9 +1060,11 @@ static int bq2562x_battery_get_property(struct power_supply *psy,
 	mutex_lock(&bq->lock);
 	state = bq->bat_state;
 	mutex_unlock(&bq->lock);
-
+	BQ2562X_DEBUG(bq->dev, "bat get property:%d", psp);
 	switch (psp) {
 	case POWER_SUPPLY_PROP_PRESENT:
+		BQ2562X_DEBUG(bq->dev, "bat get property present:%d",
+			      state.present);
 		val->intval = state.present;
 		break;
 	case POWER_SUPPLY_PROP_STATUS:
@@ -1100,6 +1124,8 @@ static int bq2562x_battery_get_property(struct power_supply *psy,
 		val->intval = state.ts_adc;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
+		BQ2562X_DEBUG(bq->dev, "bat get property capacity:%d",
+			      state.curr_percent);
 		val->intval = state.curr_percent;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
@@ -1390,6 +1416,84 @@ static int bq2562x_map_wd_to_reg(struct bq2562x_device *bq)
 	return wd_reg_val;
 }
 
+static int
+bq2562x_parse_battery_dt_vbat_to_ri(struct bq2562x_device *bq,
+				    const char *const key,
+				    struct device_node *battery_np, int *size,
+				    struct power_supply_vbat_ri_table **table)
+{
+	int len, index;
+	const __be32 *list = of_get_property(battery_np, key, &len);
+	if (list && len) {
+		*size = len / (2 * sizeof(__be32));
+
+		*table = devm_kcalloc(&bq->charger->dev, *size,
+				      sizeof(struct power_supply_vbat_ri_table),
+				      GFP_KERNEL);
+
+		if (!*table) {
+			return -ENOMEM;
+		}
+
+		for (index = 0; index < *size; index++) {
+			(*table)[index].vbat_uv = be32_to_cpu(*list++);
+			(*table)[index].ri_uohm = be32_to_cpu(*list++);
+		}
+	}
+	return 0;
+}
+
+// power_supply_core.c doesn't parse crucial attributes
+// for the simple battery. this function parses those attributes
+static int bq2562x_fixup_battery_info(struct bq2562x_device *bq)
+{
+	struct device_node *battery_np = NULL;
+	struct fwnode_handle *fwnode = NULL;
+	int err = 0;
+	struct fwnode_reference_args args;
+
+	if (bq->charger->of_node) {
+		battery_np = of_parse_phandle(bq->charger->of_node,
+					      "monitored-battery", 0);
+		if (!battery_np)
+			return -ENODEV;
+
+		fwnode = fwnode_handle_get(of_fwnode_handle(battery_np));
+	} else if (bq->charger->dev.parent) {
+		err = fwnode_property_get_reference_args(
+			dev_fwnode(bq->charger->dev.parent),
+			"monitored-battery", NULL, 0, 0, &args);
+		if (err)
+			return err;
+
+		fwnode = args.fwnode;
+	}
+	if (!fwnode)
+		return -ENOENT;
+
+	// internal resistance charging
+	fwnode_property_read_u32(
+		fwnode, "factory-internal-resistance-charging-micro-ohms",
+		&bq->bat_info->factory_internal_resistance_uohm);
+
+	err = bq2562x_parse_battery_dt_vbat_to_ri(
+		bq, "vbat-to-internal-resistance-charging-table", battery_np,
+		&bq->bat_info->vbat2ri_charging_size,
+		&bq->bat_info->vbat2ri_charging);
+	if (err)
+		goto out_put_node;
+
+	err = bq2562x_parse_battery_dt_vbat_to_ri(
+		bq, "vbat-to-internal-resistance-discharging-table", battery_np,
+		&bq->bat_info->vbat2ri_discharging_size,
+		&bq->bat_info->vbat2ri_discharging);
+
+out_put_node:
+	fwnode_handle_put(fwnode);
+	of_node_put(battery_np);
+	return err;
+}
+
 static int bq2562x_hw_init(struct bq2562x_device *bq)
 {
 	int ret = 0;
@@ -1404,6 +1508,8 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 	RET_NZ(bq2562x_reset_watchdog, bq);
 
 	RET_NZ(power_supply_get_battery_info, bq->charger, &bq->bat_info);
+
+	RET_NZ(bq2562x_fixup_battery_info, bq);
 
 	bq->init_data.ichg_max = bq->bat_info->constant_charge_current_max_ua;
 	bq->init_data.vreg_max = bq->bat_info->constant_charge_voltage_max_uv;
@@ -1512,6 +1618,11 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 		dev_err(bq->dev, "Failed to get ac detect");
 		return ret;
 	}
+
+	// can be used to emit battery percentage calculation diagnostics
+	// that can be used to calibrate a battery
+	bq->emit_battery_diag =
+		device_property_read_bool(bq->dev, "emit-battery-diag");
 
 	bq->ce_pin_override =
 		device_property_read_bool(bq->dev, "charge-enable-override");
