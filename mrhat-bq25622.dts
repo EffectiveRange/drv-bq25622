@@ -27,6 +27,7 @@
                 interrupts = <17 IRQ_TYPE_EDGE_FALLING>; /* BQ_INT_N */
                 interrupt-names = "bqint";
                 ti,watchdog-timeout-ms = <40000>;
+                ti,shutdown-type = <1>; /* by default put to ship mode in case of shutdown */
                 input-current-limit-microamp = <1600000>;
                 input-voltage-limit-microvolt = <4600000>;
                 ext-ilim-resistor = <1690>;
@@ -60,5 +61,6 @@
         max_input_uamp = <&bq25622>, "input-current-limit-microamp:0";
         min_input_uvolt = <&bq25622>, "input-voltage-limit-microvolt:0";
         ext_ilim_r = <&bq25622>, "ext-ilim-resistor:0";
+        shut_type = <&bq25622>, "ti,shutdown-type:0";
     };
 };
