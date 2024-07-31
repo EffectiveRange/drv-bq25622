@@ -126,6 +126,7 @@ enum bq2562x_shutdown_type {
 	BQ2562X_SHUT_NOOP = 0,
 	BQ2562X_SHUT_SHIP,
 	BQ2562X_SHUT_SHUTDOWN,
+	BQ2562X_SHUT_MAX_VAL = BQ2562X_SHUT_SHUTDOWN
 };
 
 struct bq2562x_sysfs {
@@ -1635,6 +1636,19 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 				       &bq->watchdog_timer);
 	if (ret) {
 		dev_err(bq->dev, "failed to read watchdog dt property");
+		return -EINVAL;
+	}
+
+	ret = device_property_read_u32(bq->dev, "ti,shutdown-type",
+				       &bq->sysfs_data.shutdown_type);
+	if (ret) {
+		dev_err(bq->dev, "failed to read shutdown type dt property");
+		return -EINVAL;
+	}
+	if (bq->sysfs_data.shutdown_type > BQ2562X_SHUT_MAX_VAL) {
+		dev_err(bq->dev,
+			"invalid shutdown type read from dt property: %u",
+			bq->sysfs_data.shutdown_type);
 		return -EINVAL;
 	}
 
