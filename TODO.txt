@@ -1,2 +1,8 @@
 nice to have:
 - support battery removal/reinsertion on the fly
+- if no battery, then 
+    - manage period = WD/8
+    - go through the  initial states after each manage period until battery is detected
+
+- if battery is removed
+  - charging state is Trickle with 0 Ibat => battery removed event
