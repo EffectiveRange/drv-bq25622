@@ -3,7 +3,7 @@ if [[ -z "$(grep bq2562x_charger /etc/modules)"  ]];
 then 
     echo "Adding bq2562x_charger to /etc/modules ..."
     echo 'bq2562x_charger' >> /etc/modules
-    depmod
+    depmod || true
 fi
 
 echo "Please add 'dtoverlay=mrhat-rx8130' if needed, then reboot ..."
