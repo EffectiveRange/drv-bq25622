@@ -37,15 +37,14 @@ build/mrhat-bq25622.dtbo: build/mrhat-bq25622.dts.pre
 
 deploy: all
 	rsync -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" -avhz --progress build/mrhat-bq25622_$(VERSION)-1_armhf.deb $(TARGET):/tmp/
-	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- sudo dpkg -r mrhat-bq25622
-	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- sudo dpkg -i /tmp/mrhat-bq25622_$(VERSION)-1_armhf.deb
+	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- sudo dpkg --force-all -i  /tmp/mrhat-bq25622_$(VERSION)-1_armhf.deb
 	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- sudo sed -ri '/^\s*dtoverlay=mrhat-bq25622/d' /boot/config.txt
 	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- "echo 'dtoverlay=mrhat-bq25622:battery_diag=true' | sudo tee -a /boot/config.txt"
 
 quickdeploy: driver
 	scp mrhat-bq25622/lib/modules/$(KVER)/bq2562x_charger.ko $(TARGET):/tmp/
-	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- sudo cp /tmp/bq2562x_charger.ko /lib/modules/$(KVER)/
 	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- "sudo rmmod bq2562x_charger || true"
+	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- sudo cp /tmp/bq2562x_charger.ko /lib/modules/$(KVER)/
 	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(TARGET) -- "sudo modprobe bq2562x_charger || true"
 	
 
