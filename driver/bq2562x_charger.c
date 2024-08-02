@@ -924,7 +924,11 @@ static int bq2562x_update_state(struct bq2562x_device *bq,
 
 static void bq2562x_charger_reset(void *data)
 {
-	// TODO: figure out if this is needed or not
+	struct bq2562x_device *bq = data;
+	// do a REG reset on on driver unload
+	regmap_update_bits(bq->regmap, BQ2562X_CHRG_CTRL_2,
+			   BQ2562X_CHRG_CTRL2_REG_RST,
+			   BQ2562X_CHRG_CTRL2_REG_RST);
 }
 
 static void bq2562x_force_ibat_dis(struct bq2562x_device *bq, u8 val)
@@ -1105,6 +1109,9 @@ static int bq2562x_battery_get_property(struct power_supply *psy,
 	state = bq->bat_state;
 	mutex_unlock(&bq->lock);
 	switch (psp) {
+	case POWER_SUPPLY_PROP_TECHNOLOGY:
+		val->intval = bq->bat_info->technology;
+		break;
 	case POWER_SUPPLY_PROP_PRESENT:
 		BQ2562X_DEBUG(bq->dev, "bat get property present:%d",
 			      state.present);
@@ -1327,6 +1334,7 @@ static enum power_supply_property bq2562x_power_supply_props[] = {
 static enum power_supply_property bq2562x_battery_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX,
@@ -1421,12 +1429,12 @@ static int bq2562x_power_supply_init(struct bq2562x_device *bq,
 	bq->charger = devm_power_supply_register(
 		bq->dev, &bq2562x_power_supply_desc, psy_cfg);
 	if (IS_ERR(bq->charger))
-		return -EINVAL;
+		return PTR_ERR(bq->charger);
 
 	bq->battery = devm_power_supply_register(bq->dev, &bq2562x_battery_desc,
 						 psy_cfg);
 	if (IS_ERR(bq->battery))
-		return -EINVAL;
+		return PTR_ERR(bq->battery);
 	return 0;
 }
 
@@ -1479,6 +1487,7 @@ bq2562x_parse_battery_dt_vbat_to_ri(struct bq2562x_device *bq,
 	int len, index;
 	const __be32 *list = of_get_property(battery_np, key, &len);
 	if (list && len) {
+		BQ2562X_DEBUG(bq->dev, "parsing table %s", key);
 		*size = len / (2 * sizeof(__be32));
 
 		*table = devm_kcalloc(&bq->charger->dev, *size,
@@ -1548,6 +1557,12 @@ out_put_node:
 	return err;
 }
 
+static void bq2562x_cleanup_battery_info(void *data)
+{
+	struct bq2562x_device *bq = data;
+	power_supply_put_battery_info(bq->battery, bq->bat_info);
+}
+
 static int bq2562x_hw_init(struct bq2562x_device *bq)
 {
 	int ret = 0;
@@ -1566,9 +1581,10 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 	       BQ2562X_CHRG_CTRL3_BATFET_CTRL_WVBUS);
 
 	bq->watchdog_timer_reg = RET_FAIL(bq2562x_map_wd_to_reg, bq);
-	RET_NZ(bq2562x_reset_watchdog, bq);
 
 	RET_NZ(power_supply_get_battery_info, bq->charger, &bq->bat_info);
+	RET_NZ(devm_add_action_or_reset, bq->dev, bq2562x_cleanup_battery_info,
+	       bq);
 
 	RET_NZ(bq2562x_fixup_battery_info, bq);
 
@@ -1605,8 +1621,6 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 
 	RET_NZ(bq2562x_set_input_curr_lim, bq, bq->init_data.ilim);
 	bq->state.ilim_curr = bq->init_data.ilim;
-
-	RET_NZ(bq2562x_start_adc_oneshot, bq);
 
 	bq->bat_state.charging_state = bq->state.charging_state =
 		POWER_SUPPLY_STATUS_UNKNOWN;
@@ -1973,12 +1987,7 @@ static int bq2562x_probe(struct i2c_client *client,
 	i2c_set_clientdata(client, bq);
 	dev_set_drvdata(dev, bq);
 
-	RET_NZ(bq2562x_parse_dt, bq, &psy_cfg, dev);
-
 	RET_NZ(devm_add_action_or_reset, dev, bq2562x_charger_reset, bq);
-
-	// need to allocate power supply before registering interrupt
-	RET_NZ(bq2562x_power_supply_init, bq, &psy_cfg, dev);
 
 	RET_FAIL(devm_register_sys_off_handler, dev,
 		 SYS_OFF_MODE_POWER_OFF_PREPARE, SYS_OFF_PRIO_FIRMWARE,
@@ -2001,8 +2010,12 @@ static int bq2562x_probe(struct i2c_client *client,
 
 	RET_FAIL(devm_add_action_or_reset, bq->dev, bq2562x_timer_cleanup, bq);
 
-	RET_NZ(bq2562x_hw_init, bq);
+	// need to allocate power supply before registering interrupt
+	RET_NZ(bq2562x_parse_dt, bq, &psy_cfg, dev);
 
+	RET_NZ(bq2562x_power_supply_init, bq, &psy_cfg, dev);
+
+	RET_NZ(bq2562x_hw_init, bq);
 	// last step to setup IRQ, as it can be called as soon as
 	// this returns, resulting in uninitialized state
 	if (client->irq) {
@@ -2019,6 +2032,8 @@ static int bq2562x_probe(struct i2c_client *client,
 	RET_NZ(bq2562x_register_attr, bq, &bq->force_ce_attr);
 	RET_NZ(bq2562x_register_attr, bq, &bq->force_cd_attr);
 
+	RET_NZ(bq2562x_reset_watchdog, bq);
+	RET_NZ(bq2562x_start_adc_oneshot, bq);
 	return 0;
 }
 
