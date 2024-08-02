@@ -1559,6 +1559,12 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 	RET_NZ(regmap_update_bits, bq->regmap, BQ2562X_CHRG_CTRL_2,
 	       BQ2562X_CHRG_CTRL2_REG_RST, BQ2562X_CHRG_CTRL2_REG_RST);
 
+	// enable batfet control with vbus for being able force reset
+	// if something goes wrong
+	RET_NZ(regmap_update_bits, bq->regmap, BQ2562X_CHRG_CTRL_3,
+	       BQ2562X_CHRG_CTRL3_BATFET_CTRL_WVBUS,
+	       BQ2562X_CHRG_CTRL3_BATFET_CTRL_WVBUS);
+
 	bq->watchdog_timer_reg = RET_FAIL(bq2562x_map_wd_to_reg, bq);
 	RET_NZ(bq2562x_reset_watchdog, bq);
 
