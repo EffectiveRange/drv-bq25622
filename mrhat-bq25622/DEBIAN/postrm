@@ -2,8 +2,6 @@
 echo "Removing module autoload for bq2562x_charger ..."
 sed -ri '/^\s*bq2562x_charger/d' /etc/modules
 
-echo "Removing dtoverlay file ..."
-rm -f /boot/overlays/mrhat-bq25622.dtbo
 
 echo "If mrhat-bq25622 driver is not required remove 'dtoverlay=mrhat-bq25622' from /boot/config.txt ..."
 
