@@ -67,6 +67,7 @@ struct bq2562x_init_data {
 	u32 ext_ilim;
 	u32 bat_cap;
 };
+
 enum bq2562x_state_enum {
 	BQ2562X_STATE_INIT = 0,
 	BQ2562X_STATE_IBAT_DIS_ADC1,
@@ -1301,11 +1302,9 @@ static void bq2562x_manage(struct bq2562x_device *bq, bool timed)
 	}
 }
 
-static irqreturn_t bq2562x_irq_handler_thread(int irq, void *private)
+static irqreturn_t bq2562x_irq_handler(int irq, void *private)
 {
 	struct bq2562x_device *bq = private;
-	BQ2562X_DEBUG(bq->dev, "bq2562x_irq_handler_thread irq:0x%08x pid:%d",
-		      irq, current->pid);
 	queue_work(bq->wq, &bq->manage_work);
 	return IRQ_HANDLED;
 }
@@ -1560,7 +1559,7 @@ out_put_node:
 static void bq2562x_cleanup_battery_info(void *data)
 {
 	struct bq2562x_device *bq = data;
-	power_supply_put_battery_info(bq->battery, bq->bat_info);
+	power_supply_put_battery_info(bq->charger, bq->bat_info);
 }
 
 static int bq2562x_hw_init(struct bq2562x_device *bq)
@@ -1605,17 +1604,17 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 	bq->init_data.ichg_max = bq->bat_info->constant_charge_current_max_ua;
 	bq->init_data.vreg_max = bq->bat_info->constant_charge_voltage_max_uv;
 	bq->init_data.bat_cap = bq->bat_info->charge_full_design_uah;
+	bq->init_data.iterm = bq->bat_info->charge_term_current_ua;
+	bq->init_data.iprechg = bq->bat_info->precharge_current_ua;
 
 	bq->bat_state.curr_percent = 0;
 	// initialize charge current
 	bq->state.ichg_curr = bq->init_data.ichg_max;
 	RET_NZ(bq2562x_set_ichrg_curr, bq, bq->init_data.ichg_max);
-	RET_NZ(bq2562x_set_prechrg_curr, bq,
-	       bq->bat_info->precharge_current_ua);
-	RET_NZ(bq2562x_set_chrg_volt, bq,
-	       bq->bat_info->constant_charge_voltage_max_uv);
+	RET_NZ(bq2562x_set_prechrg_curr, bq, bq->init_data.iprechg);
+	RET_NZ(bq2562x_set_chrg_volt, bq, bq->init_data.vreg_max);
 
-	RET_NZ(bq2562x_set_term_curr, bq, bq->bat_info->charge_term_current_ua);
+	RET_NZ(bq2562x_set_term_curr, bq, bq->init_data.iterm);
 
 	RET_NZ(bq2562x_set_input_volt_lim, bq, bq->init_data.vlim);
 
@@ -2019,8 +2018,8 @@ static int bq2562x_probe(struct i2c_client *client,
 	// last step to setup IRQ, as it can be called as soon as
 	// this returns, resulting in uninitialized state
 	if (client->irq) {
-		RET_FAIL(devm_request_threaded_irq, dev, client->irq, NULL,
-			 bq2562x_irq_handler_thread,
+		RET_FAIL(devm_request_irq, dev, client->irq,
+			 bq2562x_irq_handler,
 			 IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 			 dev_name(&client->dev), bq);
 	}
