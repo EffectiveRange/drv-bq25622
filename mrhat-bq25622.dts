@@ -32,7 +32,7 @@
                 input-voltage-limit-microvolt = <4600000>;
                 ext-ilim-resistor = <1690>;
                 monitored-battery = <&BAT1>;
-                charge-enable-gpios = <&gpio 12 GPIO_ACTIVE_HIGH>;
+                charge-enable-gpios = <&gpio 22 GPIO_ACTIVE_HIGH>;
                 status = "okay";
             };
         };
@@ -43,7 +43,7 @@
         __overlay__ {
             /* set up pin for RTC IRQ */
             bq25622_pins: bq25622_pins {
-                brcm,pins = <12 17>;
+                brcm,pins = <22 17>;
                 brcm,function = <0x0 0x1 0x0>; /* in out in */
                 brcm,pull = <0 0 0>; /* none */
             };
