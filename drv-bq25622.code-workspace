@@ -9,11 +9,16 @@
 			"-header-insertion=never"
 		],
 		"clangd.fallbackFlags": [
-			"-isystem/var/chroot/buildroot/usr/src/linux-headers-6.1.21-v7+/include",
-			"-isystem/var/chroot/buildroot/usr/src/linux-headers-6.1.21-v7+/arch/arm/include",
+			// "-isystem/var/chroot/buildroot/usr/src/linux-headers-6.1.21-v7+/include",
+			// "-isystem/var/chroot/buildroot/usr/src/linux-headers-6.1.21-v7+/arch/arm/include",
+			"-isystem/var/chroot/buildroot/usr/src/linux-headers-6.6.74+rpt-common-rpi/include",
+			"-isystem/var/chroot/buildroot/usr/src/linux-headers-6.6.74+rpt-common-rpi/arch/arm/include",					
+			"-isystem/var/chroot/buildroot/usr/src/linux-headers-6.6.74+rpt-rpi-v7/include",
+			"-isystem/var/chroot/buildroot/usr/src/linux-headers-6.6.74+rpt-rpi-v7/arch/arm/include",			
 		],
 		"files.associations": {
 			"reboot.h": "c"
-		}
+		},
+		"editor.formatOnSave": true
 	}
 }

@@ -3,6 +3,8 @@ VERSION = $(shell grep Version: mrhat-bq25622/DEBIAN/control | cut -d' ' -f2)
 # TODO: build module for all kernel versions
 KVER ?= 6.1.21+
 TARGET ?=  $(error TARGET not specified for deploy )
+DISTRO = $(shell grep VERSION_CODENAME= /home/crossbuilder/target/target | cut -d'=' -f2)
+KBASEVER = $(shell echo "$(KVER)" | cut -d'-' -f1)
 
 all: build/mrhat-bq25622_$(VERSION)-1_armhf.deb
 	@true
@@ -10,8 +12,13 @@ all: build/mrhat-bq25622_$(VERSION)-1_armhf.deb
 build/mrhat-bq25622_$(VERSION)-1_armhf.deb : driver build/mrhat-bq25622.dtbo mrhat-bq25622/DEBIAN/*
 	mkdir -p build
 	mkdir -p mrhat-bq25622/lib/modules/$(KVER)
-	mkdir -p mrhat-bq25622/boot/overlays/
-	cp build/mrhat-bq25622.dtbo mrhat-bq25622/boot/overlays/
+	if [ "$(DISTRO)" = "bullseye" ]; then \
+		mkdir -p mrhat-bq25622/boot/overlays/; \
+		cp build/mrhat-bq25622.dtbo mrhat-bq25622/boot/overlays/ ;\
+	else \
+		mkdir -p mrhat-bq25622/boot/firmware/overlays/; \
+		cp build/mrhat-bq25622.dtbo mrhat-bq25622/boot/firmware/overlays/; \
+	fi
 	dpkg-deb --root-owner-group --build mrhat-bq25622 build/mrhat-bq25622_$(VERSION)-1_armhf.deb
 
 mrhat-bq25622/lib/modules/$(KVER)/bq2562x_charger.ko: driver/*.c driver/*.h driver/Makefile
@@ -29,8 +36,12 @@ clean:
 
 build/mrhat-bq25622.dts.pre: mrhat-bq25622.dts
 	mkdir -p build/
-	cpp -nostdinc -undef -x assembler-with-cpp -I/var/chroot/buildroot/usr/src/linux-headers-$(KVER)/include -o build/mrhat-bq25622.dts.pre mrhat-bq25622.dts
-
+	if [ "$(DISTRO)" = "bullseye" ]; then \
+		cpp -nostdinc -undef -x assembler-with-cpp -I/var/chroot/buildroot/usr/src/linux-headers-$(KVER)/include -o build/mrhat-bq25622.dts.pre mrhat-bq25622.dts ;\
+	else \
+		KHDR_DIR=`ls -d1 /var/chroot/buildroot/usr/src/*$(KBASEVER)*-common-rpi`; \
+		cpp -nostdinc -undef -x assembler-with-cpp -I$${KHDR_DIR}/include -I/var/chroot/buildroot/usr/src/linux-headers-$(KVER)/include -o build/mrhat-bq25622.dts.pre mrhat-bq25622.dts ;\
+	fi
 build/mrhat-bq25622.dtbo: build/mrhat-bq25622.dts.pre
 	mkdir -p build/
 	dtc  -I dts -O dtb -o build/mrhat-bq25622.dtbo build/mrhat-bq25622.dts.pre

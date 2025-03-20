@@ -6,4 +6,4 @@ then
     depmod || true
 fi
 
-echo "Please add 'dtoverlay=mrhat-rx8130' if needed, then reboot ..."
+echo "Please add 'dtoverlay=mrhat-bq25622' if needed, then reboot ..."

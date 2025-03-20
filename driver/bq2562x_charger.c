@@ -3,6 +3,7 @@
 // Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com/
 
 #include <linux/err.h>
+#include <linux/version.h>
 #include <linux/reboot.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
@@ -1954,9 +1955,16 @@ DEVICE_ATTR(force_charge_enable, 0644, bq2562x_sysfs_force_ce_show,
 DEVICE_ATTR(force_charge_disable, 0644, bq2562x_sysfs_force_cd_show,
 	    bq2562x_sysfs_force_cd_store);
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0))
+static int bq2562x_probe(struct i2c_client *client)
+#else
 static int bq2562x_probe(struct i2c_client *client,
 			 const struct i2c_device_id *id)
+#endif
 {
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0))
+	const struct i2c_device_id *id = i2c_client_get_device_id(client);
+#endif
 	struct device *dev = &client->dev;
 	struct bq2562x_device *bq;
 	struct power_supply_config psy_cfg = {};

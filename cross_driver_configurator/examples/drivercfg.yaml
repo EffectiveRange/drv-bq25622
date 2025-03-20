@@ -1,0 +1,3 @@
+project: mrhat-bq25622
+modulename: bq2562x_charger
+sourcedir: driver/ 
