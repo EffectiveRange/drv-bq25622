@@ -1,0 +1,7 @@
+project: mrhat-bq25622
+version: auto
+modulename: bq2562x_charger
+maintainer: Effective Range Kft.
+description: >
+  Device driver and device tree overlay for the TI BQ25622 charger
+  located on Effective-Range MrHAT v1 family of extension hats
