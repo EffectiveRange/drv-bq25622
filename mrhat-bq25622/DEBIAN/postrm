@@ -1,8 +1,0 @@
-#!/bin/bash
-echo "Removing module autoload for bq2562x_charger ..."
-sed -ri '/^\s*bq2562x_charger/d' /etc/modules
-
-
-echo "If mrhat-bq25622 driver is not required remove 'dtoverlay=mrhat-bq25622' from /boot/config.txt ..."
-
-depmod
