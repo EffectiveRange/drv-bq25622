@@ -25,4 +25,6 @@ jobs:
   uses: EffectiveRange/ci-workflows/.github/workflows/xdriver-ci.yaml@v3
   secrets: 
     access-token: ${{secrets.ACTIONS_RO_TOKEN}}
+  with:
+    build-version: '["armhf-bookworm", "arm64-bookworm","armhf-bullseye", "arm64-bullseye"]'
   
