@@ -7,7 +7,7 @@
 # To get a newer version, you will need to update the SHA.
 # You can also reference a tag or branch, but the action may change without warning.
 
-name: Release
+name: CI/CD
 
 on:
   push:
@@ -20,48 +20,9 @@ on:
           - opened
           - reopened
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.sha }}
-  cancel-in-progress: true
-
-
 jobs:
-
- create_release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      discussions: write
-    steps:
-      - 
-        name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-      - 
-        name: Set up QEMU for multi-architecture builds
-        uses: docker/setup-qemu-action@v2
-      -
-        name: Extract project name
-        id: extract
-        run: |
-           echo proj="$(basename  ${{github.workspace}})" >> $GITHUB_OUTPUT
-      - 
-        name: Build Project
-        uses: devcontainers/ci@v0.3
-        with:
-          subFolder: "${{github.workspace}}"
-          configFile: .devcontainer/armhf-container/devcontainer.json
-          push: never
-          runCmd: |
-            "/workspaces/${{steps.extract.outputs.proj}}/build.sh"
-      - 
-        name: Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          files: |
-            build/*.deb
+ call_ci:
+  uses: EffectiveRange/ci-workflows/.github/workflows/xdriver-ci.yaml@v3
+  secrets: 
+    access-token: ${{secrets.ACTIONS_RO_TOKEN}}
+  
