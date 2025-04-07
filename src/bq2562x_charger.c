@@ -297,6 +297,8 @@ static struct reg_default bq25622_reg_defs[] = {
 
 static int bq2562x_watchdog_time[BQ2562X_NUM_WD_VAL] = {0, 40000, 80000, 160000};
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0))
+
 static enum power_supply_usb_type bq2562x_usb_type[] = {
 	POWER_SUPPLY_USB_TYPE_ACA,
 	POWER_SUPPLY_USB_TYPE_SDP,
@@ -304,6 +306,12 @@ static enum power_supply_usb_type bq2562x_usb_type[] = {
 	POWER_SUPPLY_USB_TYPE_DCP,
 	POWER_SUPPLY_USB_TYPE_UNKNOWN,
 };
+#else
+static const u32 bq2562x_usb_type = BIT(POWER_SUPPLY_USB_TYPE_ACA) |
+	BIT(POWER_SUPPLY_USB_TYPE_SDP) | BIT(POWER_SUPPLY_USB_TYPE_CDP) |
+	BIT(POWER_SUPPLY_USB_TYPE_DCP) | BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN);
+#endif
+
 /* clang-format on */
 
 static bool bq2562x_get_charge_enable(struct bq2562x_device *bq)
@@ -1367,7 +1375,9 @@ static const struct power_supply_desc bq2562x_power_supply_desc = {
 	.name = "bq2562x-charger",
 	.type = POWER_SUPPLY_TYPE_USB,
 	.usb_types = bq2562x_usb_type,
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0))
 	.num_usb_types = ARRAY_SIZE(bq2562x_usb_type),
+#endif
 	.properties = bq2562x_power_supply_props,
 	.num_properties = ARRAY_SIZE(bq2562x_power_supply_props),
 	.get_property = bq2562x_get_property,
@@ -1478,31 +1488,32 @@ static int bq2562x_map_wd_to_reg(struct bq2562x_device *bq)
 	return wd_reg_val;
 }
 
-static int
-bq2562x_parse_battery_dt_vbat_to_ri(struct bq2562x_device *bq,
-				    const char *const key,
-				    struct device_node *battery_np, int *size,
-				    struct power_supply_vbat_ri_table **table)
+static int bq2562x_parse_battery_dt_vbat_to_ri(
+	struct bq2562x_device *bq, const char *const key,
+	struct device_node *battery_np, int *size,
+	const struct power_supply_vbat_ri_table **table)
 {
 	int len, index;
+	struct power_supply_vbat_ri_table *table_ptr = NULL;
 	const __be32 *list = of_get_property(battery_np, key, &len);
 	if (list && len) {
 		BQ2562X_DEBUG(bq->dev, "parsing table %s", key);
 		*size = len / (2 * sizeof(__be32));
 
-		*table = devm_kcalloc(&bq->charger->dev, *size,
+		table_ptr = devm_kcalloc(&bq->charger->dev, *size,
 				      sizeof(struct power_supply_vbat_ri_table),
 				      GFP_KERNEL);
 
-		if (!*table) {
+		if (!table_ptr) {
 			return -ENOMEM;
 		}
 
 		for (index = 0; index < *size; index++) {
-			(*table)[index].vbat_uv = be32_to_cpu(*list++);
-			(*table)[index].ri_uohm = be32_to_cpu(*list++);
+			table_ptr[index].vbat_uv = be32_to_cpu(*list++);
+			table_ptr[index].ri_uohm = be32_to_cpu(*list++);
 		}
 	}
+	*table = table_ptr;
 	return 0;
 }
 
@@ -1542,14 +1553,14 @@ static int bq2562x_fixup_battery_info(struct bq2562x_device *bq)
 	err = bq2562x_parse_battery_dt_vbat_to_ri(
 		bq, "vbat-to-internal-resistance-charging-table", battery_np,
 		&bq->bat_info->vbat2ri_charging_size,
-		&bq->bat_info->vbat2ri_charging);
+		(const struct power_supply_vbat_ri_table **)&bq->bat_info->vbat2ri_charging);
 	if (err)
 		goto out_put_node;
 
 	err = bq2562x_parse_battery_dt_vbat_to_ri(
 		bq, "vbat-to-internal-resistance-discharging-table", battery_np,
 		&bq->bat_info->vbat2ri_discharging_size,
-		&bq->bat_info->vbat2ri_discharging);
+		(const struct power_supply_vbat_ri_table **)&bq->bat_info->vbat2ri_discharging);
 
 out_put_node:
 	fwnode_handle_put(fwnode);
