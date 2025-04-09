@@ -1,3 +1,4 @@
 build/*
 mrhat-*/boot/*
 mrhat-*/lib/*
+.venv/

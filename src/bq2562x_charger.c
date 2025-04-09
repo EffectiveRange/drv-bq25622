@@ -1432,10 +1432,21 @@ static const struct regmap_config bq25622_regmap_config = {
 	.volatile_reg = bq2562x_is_volatile_reg,
 };
 
+static int bq2562x_fixup_battery_info(struct bq2562x_device *bq);
+static void bq2562x_cleanup_battery_info(void *data);
+
 static int bq2562x_power_supply_init(struct bq2562x_device *bq,
 				     struct power_supply_config *psy_cfg,
 				     struct device *dev)
 {
+	int ret = 0;
+
+	RET_NZ(power_supply_get_battery_info, bq->charger, &bq->bat_info);
+	RET_NZ(devm_add_action_or_reset, bq->dev, bq2562x_cleanup_battery_info,
+	       bq);
+
+	RET_NZ(bq2562x_fixup_battery_info, bq);
+
 	bq->charger = devm_power_supply_register(
 		bq->dev, &bq2562x_power_supply_desc, psy_cfg);
 	if (IS_ERR(bq->charger))
@@ -1592,12 +1603,6 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 	       BQ2562X_CHRG_CTRL3_BATFET_CTRL_WVBUS);
 
 	bq->watchdog_timer_reg = RET_FAIL(bq2562x_map_wd_to_reg, bq);
-
-	RET_NZ(power_supply_get_battery_info, bq->charger, &bq->bat_info);
-	RET_NZ(devm_add_action_or_reset, bq->dev, bq2562x_cleanup_battery_info,
-	       bq);
-
-	RET_NZ(bq2562x_fixup_battery_info, bq);
 
 	switch (bq->bat_info->technology) {
 	case POWER_SUPPLY_TECHNOLOGY_LION:
