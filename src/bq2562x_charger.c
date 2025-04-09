@@ -1441,16 +1441,16 @@ static int bq2562x_power_supply_init(struct bq2562x_device *bq,
 {
 	int ret = 0;
 
+	bq->charger = devm_power_supply_register(
+		bq->dev, &bq2562x_power_supply_desc, psy_cfg);
+	if (IS_ERR(bq->charger))
+		return PTR_ERR(bq->charger);
+
 	RET_NZ(power_supply_get_battery_info, bq->charger, &bq->bat_info);
 	RET_NZ(devm_add_action_or_reset, bq->dev, bq2562x_cleanup_battery_info,
 	       bq);
 
 	RET_NZ(bq2562x_fixup_battery_info, bq);
-
-	bq->charger = devm_power_supply_register(
-		bq->dev, &bq2562x_power_supply_desc, psy_cfg);
-	if (IS_ERR(bq->charger))
-		return PTR_ERR(bq->charger);
 
 	bq->battery = devm_power_supply_register(bq->dev, &bq2562x_battery_desc,
 						 psy_cfg);
@@ -1511,9 +1511,9 @@ static int bq2562x_parse_battery_dt_vbat_to_ri(
 		BQ2562X_DEBUG(bq->dev, "parsing table %s", key);
 		*size = len / (2 * sizeof(__be32));
 
-		table_ptr = devm_kcalloc(&bq->charger->dev, *size,
-				      sizeof(struct power_supply_vbat_ri_table),
-				      GFP_KERNEL);
+		table_ptr = devm_kcalloc(
+			&bq->charger->dev, *size,
+			sizeof(struct power_supply_vbat_ri_table), GFP_KERNEL);
 
 		if (!table_ptr) {
 			return -ENOMEM;
@@ -1564,14 +1564,16 @@ static int bq2562x_fixup_battery_info(struct bq2562x_device *bq)
 	err = bq2562x_parse_battery_dt_vbat_to_ri(
 		bq, "vbat-to-internal-resistance-charging-table", battery_np,
 		&bq->bat_info->vbat2ri_charging_size,
-		(const struct power_supply_vbat_ri_table **)&bq->bat_info->vbat2ri_charging);
+		(const struct power_supply_vbat_ri_table **)&bq->bat_info
+			->vbat2ri_charging);
 	if (err)
 		goto out_put_node;
 
 	err = bq2562x_parse_battery_dt_vbat_to_ri(
 		bq, "vbat-to-internal-resistance-discharging-table", battery_np,
 		&bq->bat_info->vbat2ri_discharging_size,
-		(const struct power_supply_vbat_ri_table **)&bq->bat_info->vbat2ri_discharging);
+		(const struct power_supply_vbat_ri_table **)&bq->bat_info
+			->vbat2ri_discharging);
 
 out_put_node:
 	fwnode_handle_put(fwnode);
