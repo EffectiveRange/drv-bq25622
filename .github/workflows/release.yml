@@ -26,5 +26,5 @@ jobs:
   secrets: 
     access-token: ${{secrets.ACTIONS_RO_TOKEN}}
   with:
-    build-version: '["armhf-bookworm", "arm64-bookworm","armhf-bullseye", "arm64-bullseye"]'
+    build-version: '["armhf-bookworm", "arm64-bookworm"]'
   
