@@ -15,3 +15,12 @@ After this the operational state commences:
 - The irq handler processes all flag changes, but if no other event occurs, then WD expire event is driving the irq handler
 - A single ADC one-shot measurement is taken for each parameters (Except VPMID), then the ADC is operated with averaging mode only for VBAT and IBAT, others are disabled.
 - At the beginning of the phase, the averaged VBAT and IBAT values are captured used for determining the battery state of charge
+
+
+# Device tree Examples
+
+## Example 1) no irq, no ce pin, and shutdown type = NOOP
+```bash
+dtoverlay=mrhat-battery-simple
+dtoverlay=mrhat-bq25622:ce_override=true,irq_override=true,shut_type=0
+```

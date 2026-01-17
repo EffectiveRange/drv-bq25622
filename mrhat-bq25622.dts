@@ -28,9 +28,9 @@
                 interrupt-names = "bqint";
                 ti,watchdog-timeout-ms = <40000>;
                 ti,shutdown-type = <1>; /* by default put to ship mode in case of shutdown */
-                input-current-limit-microamp = <1600000>;
+                input-current-limit-microamp = <3000000>;
                 input-voltage-limit-microvolt = <4600000>;
-                ext-ilim-resistor = <1690>;
+                ext-ilim-resistor = <887>;
                 monitored-battery = <&BAT1>;
                 charge-enable-gpios = <&gpio 22 GPIO_ACTIVE_HIGH>;
                 status = "okay";
@@ -57,6 +57,7 @@
         wd_timeout = <&bq25622>, "ti,watchdog-timeout-ms:0";
         ce_n = <&bq25622>, "charge-enable-negate?";
         ce_override = <&bq25622>, "charge-enable-override?";
+        irq_override = <&bq25622>, "irq-enable-override?";
         battery_diag = <&bq25622>, "emit-battery-diag?";
         max_input_uamp = <&bq25622>, "input-current-limit-microamp:0";
         min_input_uvolt = <&bq25622>, "input-voltage-limit-microvolt:0";

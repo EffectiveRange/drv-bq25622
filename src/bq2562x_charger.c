@@ -169,6 +169,8 @@ struct bq2562x_device {
 
 	// don't use ce pin even if specified
 	bool ce_pin_override;
+	// don't use irq pin even if specified
+	bool irq_enable_override;
 	// ce pin is active low
 	bool ce_pin_negate;
 	bool emit_battery_diag;
@@ -1760,6 +1762,8 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 			return ret;
 		}
 	}
+	bq->irq_enable_override =
+		device_property_read_bool(bq->dev, "irq-enable-override");
 
 	bq->ce_pin_negate =
 		device_property_read_bool(bq->dev, "charge-enable-negate");
@@ -2043,7 +2047,7 @@ static int bq2562x_probe(struct i2c_client *client,
 	RET_NZ(bq2562x_hw_init, bq);
 	// last step to setup IRQ, as it can be called as soon as
 	// this returns, resulting in uninitialized state
-	if (client->irq) {
+	if (client->irq && !bq->irq_enable_override) {
 		RET_FAIL(devm_request_irq, dev, client->irq,
 			 bq2562x_irq_handler,
 			 IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
