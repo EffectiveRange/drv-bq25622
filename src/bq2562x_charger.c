@@ -1814,10 +1814,16 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 	}
 	bq->irq_enable_override =
 		device_property_read_bool(bq->dev, "irq-enable-override");
-
+	if (bq->irq_enable_override) {
+		dev_info(bq->dev,
+			 "irq enable override specified, won't enable irq");
+	}
 	bq->ce_pin_negate =
 		device_property_read_bool(bq->dev, "charge-enable-negate");
-
+	if (bq->ce_pin_negate) {
+		dev_info(bq->dev,
+			 "ce pin negate specified, inverting ce gpio logic");
+	}
 	return 0;
 }
 
