@@ -11,20 +11,19 @@ name: CI/CD
 
 on:
   push:
-      branches: main
-      tags: v*.*.*
+    branches: [main]
+    tags: [v*.*.*]
 
   pull_request:
-      types:
-          - synchronize
-          - opened
-          - reopened
+    types:
+      - synchronize
+      - opened
+      - reopened
 
 jobs:
- call_ci:
-  uses: EffectiveRange/ci-workflows/.github/workflows/xdriver-ci.yaml@v3
-  secrets: 
-    access-token: ${{secrets.ACTIONS_RO_TOKEN}}
-  with:
-    build-version: '["armhf-bookworm", "arm64-bookworm","armhf-trixie","arm64-trixie"]'
-  
+  call_ci:
+    uses: EffectiveRange/ci-workflows/.github/workflows/xdriver-ci.yaml@latest-xdriver
+    secrets:
+      access-token: ${{secrets.ACTIONS_RO_TOKEN}}
+    with:
+      build-version: '["armhf-bookworm", "arm64-bookworm","armhf-trixie","arm64-trixie"]'
