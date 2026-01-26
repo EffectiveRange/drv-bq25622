@@ -482,7 +482,7 @@ static int bq2562x_get_tdie_adc(struct bq2562x_device *bq)
 	if (sign) {
 		rd_buff[1] |= ~BQ2562X_ADC_TDIE_MSB_MASK;
 	}
-	read_res = ((s16)((rd_buff[1]) | rd_buff[0]));
+	read_res = ((s16)((rd_buff[1] << 8) | rd_buff[0]));
 
 	res = read_res * BQ2562X_ADC_TDIE_TEMP_STEP_01C;
 
@@ -714,9 +714,19 @@ static int bq2562x_update_adc_now(struct bq2562x_device *bq,
 				  struct bq2562x_state *state,
 				  struct bq2562x_battery_state *bat_state)
 {
-	bat_state->vbat_adc = bq2562x_get_vbat_adc(bq);
-
-	state->vbus_adc = bq2562x_get_vbus_adc(bq);
+	int ret = 0;
+	ret = bq2562x_get_vbat_adc(bq);
+	if (ret < 0) {
+		bat_state->vbat_adc = 0;
+	} else {
+		bat_state->vbat_adc = ret;
+	}
+	ret = bq2562x_get_vbus_adc(bq);
+	if (ret < 0) {
+		state->vbus_adc = 0;
+	} else {
+		state->vbus_adc = ret;
+	}
 
 	bat_state->ibat_adc = bq2562x_get_ibat_adc(bq);
 
@@ -731,7 +741,12 @@ static int bq2562x_update_adc_now(struct bq2562x_device *bq,
 static int bq2562x_update_adc_avg(struct bq2562x_device *bq,
 				  struct bq2562x_battery_state *state)
 {
-	state->vbat_adc_avg = bq2562x_get_vbat_adc(bq);
+	int ret = bq2562x_get_vbat_adc(bq);
+	if (ret < 0) {
+		state->vbat_adc_avg = 0;
+	} else {
+		state->vbat_adc_avg = ret;
+	}
 
 	state->ibat_adc_avg = bq2562x_get_ibat_adc(bq);
 
@@ -791,11 +806,25 @@ static int bq2562x_update_battery_state(struct bq2562x_device *bq,
 		// NOTE: ibat is negative when discharging!
 		// mA * mOhm = uV
 		vocv = bat_state->vbat_adc_avg -
-		       bat_state->ibat_adc_avg / 1000 * ri_comp / 1000;
+		       (bat_state->ibat_adc_avg / 1000) * (ri_comp / 1000);
 
 		// this might return -EINVAL if ocv2cap tables are not initialized
 		bat_state->curr_percent = power_supply_batinfo_ocv2cap(
 			bq->bat_info, vocv, bat_state->ts_adc);
+		if (bat_state->curr_percent < 0) {
+			// estimate by comparing to max charging voltage
+			// with a base of 3.0V (very conservative)
+			// vreg max is ensured to be > 3.0V in init
+			if (bq->init_data.vreg_max <= vocv) {
+				bat_state->curr_percent = 100;
+			} else if (vocv < 3000000) {
+				bat_state->curr_percent = 0;
+			} else {
+				bat_state->curr_percent =
+					(vocv - 3000000) * 100 /
+					(bq->init_data.vreg_max - 3000000);
+			}
+		}
 		// don't report 100% while we are actively charging
 		// using charger state to report correct value
 		// on initial evaluation as well
@@ -938,16 +967,23 @@ static void bq2562x_charger_reset(void *data)
 {
 	struct bq2562x_device *bq = data;
 	// do a REG reset on on driver unload
-	regmap_update_bits(bq->regmap, BQ2562X_CHRG_CTRL_2,
-			   BQ2562X_CHRG_CTRL2_REG_RST,
-			   BQ2562X_CHRG_CTRL2_REG_RST);
+	int ret = regmap_update_bits(bq->regmap, BQ2562X_CHRG_CTRL_2,
+				     BQ2562X_CHRG_CTRL2_REG_RST,
+				     BQ2562X_CHRG_CTRL2_REG_RST);
+	if (ret != 0) {
+		dev_err(bq->dev, "Failed to reset charger: %d", ret);
+	}
 }
 
 static void bq2562x_force_ibat_dis(struct bq2562x_device *bq, u8 val)
 {
-	regmap_update_bits(bq->regmap, BQ2562X_CHRG_CTRL_1,
-			   BQ2562X_CHRG_CTRL1_FORCE_IBATDIS,
-			   BQ2562X_CHRG_CTRL1_FORCE_IBATDIS * (val ? 1 : 0));
+	int ret = regmap_update_bits(bq->regmap, BQ2562X_CHRG_CTRL_1,
+				     BQ2562X_CHRG_CTRL1_FORCE_IBATDIS,
+				     BQ2562X_CHRG_CTRL1_FORCE_IBATDIS *
+					     (val ? 1 : 0));
+	if (ret != 0) {
+		dev_err(bq->dev, "Failed to set FORCE_IBATDIS: %d", ret);
+	}
 }
 
 static int bq2562x_set_property(struct power_supply *psy,
@@ -1624,6 +1660,11 @@ static int bq2562x_hw_init(struct bq2562x_device *bq)
 
 	bq->init_data.ichg_max = bq->bat_info->constant_charge_current_max_ua;
 	bq->init_data.vreg_max = bq->bat_info->constant_charge_voltage_max_uv;
+	if (bq->init_data.vreg_max <= 3000000) {
+		dev_err(bq->dev, "unsupported charge voltage:%u",
+			bq->init_data.vreg_max);
+		return -EINVAL;
+	}
 	bq->init_data.bat_cap = bq->bat_info->charge_full_design_uah;
 	bq->init_data.iterm = bq->bat_info->charge_term_current_ua;
 	bq->init_data.iprechg = bq->bat_info->precharge_current_ua;
@@ -1706,11 +1747,14 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 	if (bq->device_id == BQ25622) {
 		ret = device_property_read_u32(bq->dev, "ext-ilim-resistor",
 					       &ext_ilim_r);
+		if (ret || ext_ilim_r == 0) {
+			return -EINVAL;
+		}
 		// using a uA value here requires 64bit math
 		// keeping in mA, then scaling it up to uA
 		bq->init_data.ext_ilim =
 			BQ25622_K_ILIM_mA_MAX / ext_ilim_r * 1000;
-		if (ret || ext_ilim_r == 0 || bq->init_data.ext_ilim == 0) {
+		if (bq->init_data.ext_ilim == 0) {
 			return -EINVAL;
 		}
 	}
@@ -1729,6 +1773,12 @@ static int bq2562x_parse_dt(struct bq2562x_device *bq,
 				       &bq->ts_coeff_scale);
 	if (ret)
 		bq->ts_coeff_scale = BQ2562X_TS_ADC_COEFF_SCALE_DEF;
+
+	if (bq->ts_coeff_scale <= 0) {
+		dev_err(bq->dev,
+			"Invalid ts-adc-coeff-scale: must be positive");
+		return -EINVAL;
+	}
 
 	dev_info(bq->dev, "TS ADC coefficients a=%u b=%u scale=%u",
 		 bq->ts_coeff_a, bq->ts_coeff_b, bq->ts_coeff_scale);
@@ -2001,7 +2051,7 @@ static int bq2562x_probe(struct i2c_client *client,
 
 	mutex_init(&bq->lock);
 
-	strncpy(bq->model_name, id->name, I2C_NAME_SIZE);
+	strscpy(bq->model_name, id->name, I2C_NAME_SIZE);
 
 	bq->device_id = id->driver_data;
 
@@ -2023,10 +2073,9 @@ static int bq2562x_probe(struct i2c_client *client,
 		 bq2562x_power_off_handler, bq);
 
 	bq->wq = create_singlethread_workqueue("manage_wq");
-	if (IS_ERR(bq->wq)) {
-		ret = PTR_ERR(bq->wq);
-		dev_err(bq->dev, "failed to create workqueue:%d", ret);
-		return ret;
+	if (!bq->wq) {
+		dev_err(bq->dev, "failed to create workqueue");
+		return -ENOMEM;
 	}
 	RET_FAIL(devm_add_action_or_reset, bq->dev, bq2562x_cleanup_workqueue,
 		 bq);
